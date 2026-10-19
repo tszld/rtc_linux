@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+server/data/
+server/config.local.json
+agent/config.local.json
+caller/config.local.json
+*.log
+
