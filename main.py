@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import secrets
@@ -27,6 +28,35 @@ def run_server(args: argparse.Namespace) -> int:
 
     config = load_config()
     port = args.port or config.port
+    if args.create_admin or args.reset_admin_password:
+        from server.admin import (
+            create_initial_admin,
+            reset_initial_admin_password,
+        )
+        from server.db import initialize_database
+
+        initialize_database(config, end_stale_calls=False)
+        username = args.admin_username or "admin"
+        password = prompt_admin_password(
+            "重置密码" if args.reset_admin_password else "创建管理员"
+        )
+        if password is None:
+            return 1
+        if args.reset_admin_password:
+            reset_initial_admin_password(
+                config,
+                username=username,
+                password=password,
+            )
+            print(f"超级管理员 {username} 的密码已重置。")
+        else:
+            created = create_initial_admin(
+                config,
+                username=username,
+                password=password,
+            )
+            print(f"超级管理员 {created.username} 已创建。")
+        return 0
     if args.stop:
         return stop_server(config, port)
 
@@ -63,6 +93,18 @@ def run_server(args: argparse.Namespace) -> int:
         except FileNotFoundError:
             pass
     return 0
+
+
+def prompt_admin_password(action: str) -> str | None:
+    password = getpass.getpass(f"请输入{action}的新密码：")
+    if not password:
+        print("密码不能为空。", file=sys.stderr)
+        return None
+    confirmation = getpass.getpass("请再次输入密码：")
+    if password != confirmation:
+        print("两次输入的密码不一致。", file=sys.stderr)
+        return None
+    return password
 
 
 def server_control_path(config, port: int) -> Path:
@@ -131,10 +173,10 @@ def run_caller(args: argparse.Namespace) -> int:
     arguments = []
     if args.backend:
         arguments.extend(["--backend", args.backend])
-    if args.client_id:
-        arguments.extend(["--client-id", args.client_id])
     if args.name:
         arguments.extend(["--name", args.name])
+    if args.port:
+        arguments.extend(["--port", str(args.port)])
     if args.no_browser:
         arguments.append("--no-browser")
 
@@ -157,6 +199,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="停止当前电脑上正在运行的后端",
     )
+    server_parser.add_argument(
+        "--create-admin",
+        action="store_true",
+        help="创建唯一超级管理员",
+    )
+    server_parser.add_argument(
+        "--reset-admin-password",
+        action="store_true",
+        help="重置超级管理员密码",
+    )
+    server_parser.add_argument(
+        "--admin-username",
+        default="admin",
+        help="管理员用户名，默认 admin",
+    )
     server_parser.set_defaults(handler=run_server)
 
     agent_parser = subparsers.add_parser("agent", help="启动 PySide6 客服端")
@@ -164,8 +221,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     caller_parser = subparsers.add_parser("caller", help="启动本机呼叫页面")
     caller_parser.add_argument("--backend", help="覆盖集中后端地址")
-    caller_parser.add_argument("--client-id", help="覆盖呼叫客户端编号")
     caller_parser.add_argument("--name", help="覆盖呼叫客户端显示名称")
+    caller_parser.add_argument("--port", type=int, help="覆盖本机页面端口")
     caller_parser.add_argument(
         "--no-browser", action="store_true", help="只启动页面服务"
     )

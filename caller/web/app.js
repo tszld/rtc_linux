@@ -20,6 +20,12 @@ let audioRetryDelayMs = 1000;
 let audioRetryErrorReported = false;
 let screenTrack = null;
 let screenPublishing = false;
+let installationUuid;
+let clientCredential;
+let clientRecord;
+let registrationTimer;
+let isClientApproved = false;
+let registrationRecoveryAction = "retry";
 
 const MICROPHONE_TIMEOUT_MS = 30000;
 const RTC_JOIN_TIMEOUT_MS = 20000;
@@ -72,7 +78,7 @@ function setError(message) {
 function setBadge(status) {
   const labels = {
     created: "正在准备",
-    waiting: "等待客服",
+    waiting: "排队中",
     connecting: "客服连接中",
     active: "通话中",
     interrupted: "连接异常",
@@ -84,16 +90,201 @@ function setBadge(status) {
 }
 
 function setBusy(busy) {
-  $("startCall").disabled = busy;
+  $("startCall").disabled = busy || !isClientApproved;
   $("hangup").disabled = !busy;
   $("mute").disabled = !busy || !microphone;
   updateScreenShareButton();
 }
 
+function clientHeaders(extra = {}) {
+  const headers = {
+    "X-Installation-UUID": installationUuid,
+    ...extra,
+  };
+  if (clientCredential) {
+    headers["X-Client-Credential"] = clientCredential;
+  }
+  return headers;
+}
+
+async function saveClientCredential(credential) {
+  if (!credential || credential === clientCredential) {
+    return;
+  }
+  const response = await fetch("/client-credential", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ client_credential: credential }),
+  });
+  if (!response.ok) {
+    throw new Error("无法保存客户端设备凭证");
+  }
+  clientCredential = credential;
+}
+
+function stopRegistrationPolling() {
+  clearTimeout(registrationTimer);
+  registrationTimer = undefined;
+}
+
+function hideRegistrationRecovery() {
+  $("reRegister").hidden = true;
+  $("reRegister").textContent = "重新注册";
+  registrationRecoveryAction = "retry";
+}
+
+function showRegistrationRecovery(action) {
+  registrationRecoveryAction = action;
+  $("reRegister").hidden = false;
+  $("reRegister").textContent = action === "retry" ? "立即重试" : "重新注册";
+}
+
+function applyClientStatus(nextClient) {
+  clientRecord = nextClient;
+  $("clientId").value = nextClient?.id || "待分配";
+  $("clientApproval").textContent = {
+    pending: "等待管理员审批",
+    approved: "已批准",
+    rejected: "已拒绝",
+    disabled: "已停用",
+  }[nextClient?.status] || "状态未知";
+  if (["rejected", "disabled"].includes(nextClient?.status)) {
+    showRegistrationRecovery("reregister");
+  } else {
+    hideRegistrationRecovery();
+  }
+  if (nextClient?.status === "approved") {
+    isClientApproved = true;
+    $("displayName").value = nextClient.displayName;
+    $("displayName").readOnly = true;
+    $("statusText").textContent = "客户端已批准，可以发起呼叫。";
+    stopRegistrationPolling();
+  } else {
+    isClientApproved = false;
+    $("displayName").value =
+      nextClient?.displayName || config.defaultName || "未命名客户端";
+    $("displayName").readOnly = true;
+    if (nextClient?.status === "pending") {
+      $("statusText").textContent = "客户端已提交注册，正在等待管理员审批。";
+    } else if (nextClient?.status === "rejected") {
+      const reason = nextClient.statusReason
+        ? `：${nextClient.statusReason}`
+        : "，请联系管理员。";
+      $("statusText").textContent = `客户端注册已被拒绝${reason}`;
+    } else if (nextClient?.status === "disabled") {
+      const reason = nextClient.statusReason
+        ? `：${nextClient.statusReason}`
+        : "，请联系管理员。";
+      $("statusText").textContent = `客户端已被停用${reason}`;
+    }
+  }
+  setBusy(Boolean(call && call.status !== "ended"));
+}
+
+async function resetLocalIdentity() {
+  const response = await fetch("/client-reset-identity", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{}",
+  });
+  const body = await readJson(response);
+  if (!body.installationUuid) {
+    throw new Error("本机未能生成新的设备身份");
+  }
+  installationUuid = body.installationUuid;
+  clientCredential = null;
+  clientRecord = null;
+  isClientApproved = false;
+  $("clientId").value = "待分配";
+  $("clientApproval").textContent = "等待重新注册";
+  $("displayName").value = config.defaultName || "未命名客户端";
+  $("displayName").readOnly = true;
+}
+
+async function reregisterClient() {
+  if (registrationRecoveryAction === "retry") {
+    await registerClient();
+    return;
+  }
+  $("reRegister").disabled = true;
+  setError("");
+  try {
+    if (registrationRecoveryAction === "reset_identity") {
+      await resetLocalIdentity();
+      await registerClient();
+    } else {
+      if (!clientRecord?.id || !clientCredential) {
+        throw new Error("缺少客户端身份凭证，请联系管理员重置设备凭证");
+      }
+      const response = await fetch(
+        `${config.backendUrl}/api/clients/reregister`,
+        {
+          method: "POST",
+          headers: clientHeaders(),
+        },
+      );
+      const body = await readJson(response);
+      applyClientStatus(body.client);
+      if (body.client?.status === "pending") {
+        registrationTimer = setTimeout(registerClient, 5000);
+      }
+    }
+  } catch (error) {
+    setError(`重新注册失败：${errorMessage(error, "未知错误")}`);
+  } finally {
+    $("reRegister").disabled = false;
+  }
+}
+
+async function registerClient() {
+  stopRegistrationPolling();
+  if (!installationUuid) {
+    setError("本机缺少客户端安装标识。");
+    return;
+  }
+  let shouldRetry = true;
+  try {
+    const displayName = config.defaultName || "未命名客户端";
+    const response = await fetch(`${config.backendUrl}/api/clients/register`, {
+      method: "POST",
+      headers: clientHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        installation_uuid: installationUuid,
+        display_name: displayName,
+      }),
+    });
+    const body = await readJson(response);
+    await saveClientCredential(body.credential);
+    applyClientStatus(body.client);
+    shouldRetry = body.client?.status === "pending";
+    setError("");
+  } catch (error) {
+    isClientApproved = false;
+    $("clientApproval").textContent = "注册失败";
+    const needsNewIdentity = [401, 403].includes(error.status);
+    shouldRetry = !needsNewIdentity;
+    if (needsNewIdentity) {
+      $("statusText").textContent =
+        "设备凭证已失效，请点击“重新注册”生成新的设备身份。";
+      setError("客户端设备凭证无效，重新注册后需要管理员再次审批。");
+      showRegistrationRecovery("reset_identity");
+    } else {
+      $("statusText").textContent = "客户端注册失败，正在重试。";
+      setError(`客户端注册失败：${errorMessage(error, "未知错误")}`);
+      showRegistrationRecovery("retry");
+    }
+  }
+  if (shouldRetry) {
+    registrationTimer = setTimeout(registerClient, 5000);
+  }
+}
+
 async function readJson(response) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(body.detail || `HTTP_${response.status}`);
+    const error = new Error(body.detail || `HTTP_${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return body;
 }
@@ -406,7 +597,12 @@ function applyCall(nextCall) {
   $("sessionId").textContent = call.id;
   setBadge(call.status);
   if (call.status === "waiting") {
-    $("statusText").textContent = "音频已发布，正在等待客服接听。";
+    const position = Number(call.queuePosition);
+    const size = Number(call.queueSize);
+    $("statusText").textContent =
+      Number.isInteger(position) && position > 0
+        ? `正在排队，当前第 ${position} 位，共 ${size} 个呼叫等待接入。`
+        : "正在排队，客服空闲后将自动接入。";
   } else if (call.status === "connecting") {
     $("statusText").textContent = "客服已接听，正在建立通话。";
   } else if (call.status === "active") {
@@ -422,7 +618,7 @@ function applyCall(nextCall) {
 }
 
 async function startCall() {
-  if (call || ending) {
+  if (call || ending || !isClientApproved || !clientRecord) {
     return;
   }
   setError("");
@@ -430,12 +626,12 @@ async function startCall() {
   setBadge("created");
   $("statusText").textContent = "正在创建会话。";
   try {
-    const name = $("displayName").value.trim() || config.defaultName;
+    const name = clientRecord.displayName || config.defaultName;
     const response = await fetch(`${config.backendUrl}/api/calls`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: clientHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
-        client_id: config.clientId,
+        client_id: clientRecord.id,
         client_name: name,
       }),
     });
@@ -474,18 +670,21 @@ async function startCall() {
       RTC_PUBLISH_TIMEOUT_MS,
       "发布麦克风音频超时。",
     );
-    setBadge("waiting");
-    $("statusText").textContent = "麦克风已发布，正在等待客服接听。";
-
-    const readyResponse = await fetch(
-      `${config.backendUrl}/api/calls/${call.id}/ready`,
-      {
-        method: "POST",
-        headers: { "X-Caller-Token": callerToken },
-      },
-    );
-    const readyBody = await readJson(readyResponse);
-    applyCall(readyBody.call);
+    if (body.call.status === "created" || body.call.status === "waiting") {
+      setBadge("waiting");
+      $("statusText").textContent = "麦克风已发布，正在进入客服排队。";
+      const readyResponse = await fetch(
+        `${config.backendUrl}/api/calls/${call.id}/ready`,
+        {
+          method: "POST",
+          headers: { "X-Caller-Token": callerToken },
+        },
+      );
+      const readyBody = await readJson(readyResponse);
+      applyCall(readyBody.call);
+    } else {
+      applyCall(body.call);
+    }
     await connectEvents(body.wsTicket);
     heartbeatTimer = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -592,6 +791,8 @@ $("shareScreen").addEventListener("click", async () => {
   }
 });
 
+$("reRegister").addEventListener("click", reregisterClient);
+
 $("resumeAudio").addEventListener("click", async () => {
   try {
     for (const track of remoteTracks.values()) {
@@ -607,6 +808,7 @@ $("resumeAudio").addEventListener("click", async () => {
 $("hangup").addEventListener("click", () => finishLocal(true));
 
 window.addEventListener("pagehide", () => {
+  stopRegistrationPolling();
   if (call && callerToken && !ending) {
     fetch(`${config.backendUrl}/api/calls/${call.id}/end`, {
       method: "POST",
@@ -618,12 +820,12 @@ window.addEventListener("pagehide", () => {
 
 async function initialize() {
   config = await fetch("/config.json").then((response) => response.json());
-  $("clientId").value = config.clientId;
+  installationUuid = config.installationUuid;
+  clientCredential = config.clientCredential;
+  $("clientId").value = "待分配";
   $("displayName").value = config.defaultName;
-  $("displayName").addEventListener("change", () => {
-    $("displayName").value = $("displayName").value.trim().slice(0, 64);
-  });
   await checkBackend();
+  await registerClient();
 }
 
 initialize().catch((error) => {

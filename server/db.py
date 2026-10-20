@@ -34,6 +34,60 @@ CREATE TABLE IF NOT EXISTS agent_sessions (
 CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent
 ON agent_sessions(agent_id, revoked_at, expires_at);
 
+CREATE TABLE IF NOT EXISTS admin_accounts (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_sessions (
+    token_hash TEXT PRIMARY KEY,
+    admin_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    revoked_at TEXT,
+    FOREIGN KEY(admin_id) REFERENCES admin_accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin
+ON admin_sessions(admin_id, revoked_at);
+
+CREATE TABLE IF NOT EXISTS clients (
+    id TEXT PRIMARY KEY,
+    installation_uuid TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    credential_hash TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    approved_at TEXT,
+    approved_by TEXT,
+    disabled_at TEXT,
+    status_reason TEXT,
+    FOREIGN KEY(approved_by) REFERENCES admin_accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_clients_status_created
+ON clients(status, created_at);
+
+CREATE TABLE IF NOT EXISTS admin_audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    admin_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    result TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(admin_id) REFERENCES admin_accounts(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_admin_audit_created
+ON admin_audit_events(created_at);
+
 CREATE TABLE IF NOT EXISTS calls (
     id TEXT PRIMARY KEY,
     room_id TEXT NOT NULL UNIQUE,

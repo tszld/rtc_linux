@@ -11,11 +11,18 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 SERVER_DIR = ROOT_DIR / "server"
 
 
+def resolve_project_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    return path.resolve()
+
+
 @dataclass
 class ServerConfig:
     app_id: str = "cn4zs9jm"
     app_key: str = ""
-    db_path: Path = SERVER_DIR / "data" / "rtc.db"
+    db_path: Path = Path("server/data/rtc.db")
     host: str = "0.0.0.0"
     port: int = 8000
     rtc_token_ttl_seconds: int = 3600
@@ -40,6 +47,9 @@ class ServerConfig:
         ]
     )
 
+    def __post_init__(self) -> None:
+        self.db_path = resolve_project_path(self.db_path)
+
 
 def _load_json(path: Path) -> dict[str, Any]:
     if not path.is_file():
@@ -59,7 +69,9 @@ def load_config() -> ServerConfig:
     config.app_key = os.getenv("RTC_APP_KEY", config.app_key)
     config.host = os.getenv("RTC_HOST", config.host)
     config.port = int(os.getenv("RTC_PORT", str(config.port)))
-    config.db_path = Path(os.getenv("RTC_DB_PATH", str(config.db_path))).resolve()
+    config.db_path = resolve_project_path(
+        os.getenv("RTC_DB_PATH", str(config.db_path))
+    )
     config.rtc_token_ttl_seconds = int(
         os.getenv("RTC_TOKEN_TTL_SECONDS", str(config.rtc_token_ttl_seconds))
     )

@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
@@ -18,6 +19,15 @@ from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect as websocket_connect
 
 from server.app import create_app
+from server.admin import (
+    AdminError,
+    create_agent,
+    create_initial_admin,
+    list_admin_audit,
+    set_agent_enabled,
+    set_client_status,
+    update_client_display_name,
+)
 from server.auth import (
     AuthError,
     NO_EXPIRY_AT,
@@ -28,13 +38,24 @@ from server.auth import (
 from server.calls import (
     CallError,
     agent_hangup,
+    assign_waiting_calls,
     claim_call,
     create_call,
+    create_call_for_client,
     expire_calls,
     get_call,
+    get_assigned_call,
     mark_agent_connected,
     mark_agent_disconnected,
+    mark_caller_disconnected,
     mark_caller_ready,
+)
+from server.clients import (
+    ClientError,
+    authenticate_client,
+    register_client,
+    request_client_reregistration,
+    require_approved_client,
 )
 from server.config import ServerConfig
 from server.db import db_session, initialize_database, iso_time, utc_now
@@ -177,6 +198,156 @@ class BackendServiceTests(unittest.TestCase):
         self.assertTrue(privilege & Service.ENABLE_AUDIO_PRIVILEGE)
         self.assertTrue(privilege & Service.ENABLE_SCREEN_PRIVILEGE)
 
+    def test_client_registration_approval_and_authenticated_call(self) -> None:
+        admin = create_initial_admin(
+            self.config,
+            username="admin",
+            password="admin-pass",
+        )
+        installation_uuid = str(uuid.uuid4())
+        registered, credential = register_client(
+            self.config,
+            installation_uuid=installation_uuid,
+            display_name="一号客户端",
+            credential=None,
+        )
+        self.assertEqual(registered["status"], "pending")
+        self.assertTrue(credential)
+        repeated, repeated_credential = register_client(
+            self.config,
+            installation_uuid=installation_uuid,
+            display_name="客户端自行修改的名称",
+            credential=credential,
+        )
+        self.assertEqual(repeated["displayName"], "一号客户端")
+        self.assertIsNone(repeated_credential)
+        update_client_display_name(
+            self.config,
+            admin,
+            client_id=registered["id"],
+            display_name="管理员改名客户端",
+        )
+        after_admin_rename, _ = register_client(
+            self.config,
+            installation_uuid=installation_uuid,
+            display_name="客户端再次尝试改名",
+            credential=credential,
+        )
+        self.assertEqual(
+            after_admin_rename["displayName"],
+            "管理员改名客户端",
+        )
+        with db_session(self.config) as connection:
+            stored_hash = connection.execute(
+                "SELECT credential_hash FROM clients WHERE id = ?",
+                (registered["id"],),
+            ).fetchone()[0]
+        self.assertNotEqual(stored_hash, credential)
+
+        pending = authenticate_client(
+            self.config,
+            installation_uuid=installation_uuid,
+            credential=credential,
+        )
+        with self.assertRaises(ClientError):
+            require_approved_client(pending)
+
+        set_client_status(
+            self.config,
+            admin,
+            client_id=registered["id"],
+            status="approved",
+        )
+        approved = require_approved_client(
+            authenticate_client(
+                self.config,
+                installation_uuid=installation_uuid,
+                credential=credential,
+            )
+        )
+        first_call, _, _ = create_call_for_client(self.config, client=approved)
+        second_call, _, _ = create_call_for_client(self.config, client=approved)
+        self.assertEqual(first_call["id"], second_call["id"])
+        self.assertEqual(first_call["callerId"], registered["id"])
+
+    def test_admin_can_create_and_disable_agent(self) -> None:
+        admin = create_initial_admin(
+            self.config,
+            username="admin",
+            password="admin-pass",
+        )
+        agent = create_agent(
+            self.config,
+            admin,
+            username="agent-new",
+            display_name="新客服",
+            password="temporary",
+        )
+        login_agent(self.config, "agent-new", "temporary")
+        set_agent_enabled(
+            self.config,
+            admin,
+            agent_id=agent["id"],
+            enabled=False,
+        )
+        with self.assertRaises(AuthError):
+            login_agent(self.config, "agent-new", "temporary")
+        events = list_admin_audit(self.config)
+        self.assertEqual(
+            {event["action"] for event in events},
+            {"agent_create", "agent_disable"},
+        )
+
+    def test_only_one_super_admin_can_be_created(self) -> None:
+        create_initial_admin(
+            self.config,
+            username="admin",
+            password="admin-pass",
+        )
+        with self.assertRaises(AdminError):
+            create_initial_admin(
+                self.config,
+                username="admin-2",
+                password="admin-pass",
+            )
+
+    def test_rejected_client_can_request_reregistration(self) -> None:
+        admin = create_initial_admin(
+            self.config,
+            username="admin",
+            password="admin-pass",
+        )
+        installation_uuid = str(uuid.uuid4())
+        registered, credential = register_client(
+            self.config,
+            installation_uuid=installation_uuid,
+            display_name="重新注册客户端",
+            credential=None,
+        )
+        set_client_status(
+            self.config,
+            admin,
+            client_id=registered["id"],
+            status="rejected",
+            reason="测试拒绝",
+        )
+        client = authenticate_client(
+            self.config,
+            installation_uuid=installation_uuid,
+            credential=credential,
+        )
+        reregistered = request_client_reregistration(self.config, client)
+        self.assertEqual(reregistered["status"], "pending")
+        self.assertEqual(reregistered["id"], registered["id"])
+        self.assertEqual(reregistered["statusReason"], "client_reregister")
+
+    def test_caller_disconnect_immediately_ends_call(self) -> None:
+        call, _ = create_ready_call(self.config, "caller-disconnect")
+        self.assertTrue(mark_caller_disconnected(self.config, call["id"]))
+        ended = get_call(self.config, call["id"])
+        self.assertEqual(ended["status"], "ended")
+        self.assertEqual(ended["endReason"], "caller_disconnected")
+
     def test_duplicate_login_is_rejected_until_logout(self) -> None:
         token, _, _ = login_agent(self.config, "agent01", "agent123")
         self.assertTrue(token)
@@ -285,6 +456,59 @@ class BackendServiceTests(unittest.TestCase):
             claim_call(self.config, second["id"], agent)
         self.assertEqual(context.exception.status_code, 409)
 
+    def test_auto_assignment_is_fifo_and_reuses_freed_agent(self) -> None:
+        _, agent_one, _ = login_agent(self.config, "agent01", "agent123")
+        _, agent_two, _ = login_agent(self.config, "agent02", "agent123")
+        first, _ = create_ready_call(self.config, "caller-auto-first")
+        second, _ = create_ready_call(self.config, "caller-auto-second")
+        third, _ = create_ready_call(self.config, "caller-auto-third")
+
+        self.assertEqual(get_call(self.config, first["id"])["queuePosition"], 1)
+        self.assertEqual(get_call(self.config, second["id"])["queuePosition"], 2)
+        self.assertEqual(get_call(self.config, third["id"])["queuePosition"], 3)
+        self.assertEqual(get_call(self.config, third["id"])["queueSize"], 3)
+
+        assigned = assign_waiting_calls(
+            self.config,
+            [agent_two.id, agent_one.id],
+        )
+        self.assertEqual(
+            [call["id"] for call in assigned],
+            [first["id"], second["id"]],
+        )
+        self.assertEqual(assigned[0]["claimedAgentId"], agent_two.id)
+        self.assertEqual(assigned[1]["claimedAgentId"], agent_one.id)
+
+        third_waiting = get_call(self.config, third["id"])
+        self.assertEqual(third_waiting["status"], "waiting")
+        self.assertEqual(third_waiting["queuePosition"], 1)
+        self.assertEqual(third_waiting["queueSize"], 1)
+        self.assertEqual(
+            assign_waiting_calls(
+                self.config,
+                [agent_one.id, agent_two.id],
+            ),
+            [],
+        )
+
+        assigned_call, rtc_auth = get_assigned_call(
+            self.config,
+            first["id"],
+            agent_two,
+        )
+        self.assertEqual(assigned_call["claimedAgentId"], agent_two.id)
+        self.assertEqual(rtc_auth["channel"], first["roomId"])
+        with self.assertRaises(CallError):
+            get_assigned_call(self.config, first["id"], agent_one)
+
+        agent_hangup(self.config, first["id"], agent_two)
+        reused = assign_waiting_calls(
+            self.config,
+            [agent_one.id, agent_two.id],
+        )
+        self.assertEqual([call["id"] for call in reused], [third["id"]])
+        self.assertEqual(reused[0]["claimedAgentId"], agent_two.id)
+
     def test_logout_allows_relogin(self) -> None:
         first_token, first_agent, _ = login_agent(
             self.config, "agent01", "agent123"
@@ -349,6 +573,29 @@ class BackendServiceTests(unittest.TestCase):
         self.assertEqual(consumed.identity, "agent-test")
         self.assertIsNone(manager.consume_ticket(ticket, "agent"))
 
+    def test_agent_dispatch_order_rotates_after_last_assignment(self) -> None:
+        manager = ConnectionManager(self.config)
+        manager.agent_connections = {
+            "agent-a": object(),
+            "agent-b": object(),
+        }
+        self.assertEqual(
+            manager.connected_agent_ids(),
+            ["agent-a", "agent-b"],
+        )
+
+        manager.note_assignments([{"claimedAgentId": "agent-a"}])
+        self.assertEqual(
+            manager.connected_agent_ids(),
+            ["agent-b", "agent-a"],
+        )
+
+        manager.note_assignments([{"claimedAgentId": "agent-b"}])
+        self.assertEqual(
+            manager.connected_agent_ids(),
+            ["agent-a", "agent-b"],
+        )
+
     def test_database_does_not_store_app_key_or_plaintext_password(self) -> None:
         with db_session(self.config) as connection:
             table_names = [
@@ -378,6 +625,12 @@ class HttpContractTests(unittest.TestCase):
             app_key="test-app-key",
             db_path=Path(cls.temp.name) / "http.db",
             seed_agents=make_seed_agents(20),
+        )
+        initialize_database(cls.config, end_stale_calls=False)
+        create_initial_admin(
+            cls.config,
+            username="admin",
+            password="admin-pass",
         )
         cls.app = create_app(cls.config)
         cls.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -417,6 +670,70 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         return payload["accessToken"]
 
+    def admin_login(self) -> str:
+        status, payload = request_json(
+            self.base_url,
+            "POST",
+            "/api/admin/login",
+            body={"username": "admin", "password": "admin-pass"},
+        )
+        self.assertEqual(status, 200, payload)
+        return payload["accessToken"]
+
+    def register_approved_client(
+        self,
+        client_key: str,
+        *,
+        admin_token: str | None = None,
+    ) -> tuple[dict, dict[str, str]]:
+        admin_token = admin_token or self.admin_login()
+        installation_uuid = str(
+            uuid.uuid5(uuid.NAMESPACE_DNS, f"rtc-test:{client_key}")
+        )
+        status, registered = request_json(
+            self.base_url,
+            "POST",
+            "/api/clients/register",
+            body={
+                "installation_uuid": installation_uuid,
+                "display_name": client_key,
+            },
+        )
+        self.assertEqual(status, 200, registered)
+        client = registered["client"]
+        credential = registered["credential"]
+        status, approved = request_json(
+            self.base_url,
+            "POST",
+            f"/api/admin/clients/{client['id']}/approve",
+            token=admin_token,
+        )
+        self.assertEqual(status, 200, approved)
+        return client, {
+            "X-Installation-UUID": installation_uuid,
+            "X-Client-Credential": credential,
+        }
+
+    def create_authenticated_call(
+        self,
+        client_key: str,
+        *,
+        admin_token: str | None = None,
+    ) -> tuple[dict, dict[str, str]]:
+        client, client_headers = self.register_approved_client(
+            client_key,
+            admin_token=admin_token,
+        )
+        status, created = request_json(
+            self.base_url,
+            "POST",
+            "/api/calls",
+            body={"client_id": client["id"], "client_name": client_key},
+            headers=client_headers,
+        )
+        self.assertEqual(status, 200, created)
+        return created, client_headers
+
     def test_http_call_flow_and_conflict(self) -> None:
         status, health = request_json(self.base_url, "GET", "/api/health")
         self.assertEqual(status, 200)
@@ -425,13 +742,7 @@ class HttpContractTests(unittest.TestCase):
 
         agent_one = self.login("agent01")
         agent_two = self.login("agent02")
-        status, created = request_json(
-            self.base_url,
-            "POST",
-            "/api/calls",
-            body={"client_id": "caller-http", "client_name": "HTTP 呼叫"},
-        )
-        self.assertEqual(status, 200, created)
+        created, _ = self.create_authenticated_call("caller-http")
         call_id = created["call"]["id"]
         caller_token = created["callerToken"]
 
@@ -490,6 +801,105 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(status, 200, caller_view)
         self.assertEqual(caller_view["call"]["status"], "ended")
 
+    def test_ready_auto_assigns_connected_agent_and_queues_next_call(self) -> None:
+        admin_token = self.admin_login()
+        agent_token = self.login("agent18")
+        wrong_agent_token = self.login("agent19")
+        first, _ = self.create_authenticated_call(
+            "caller-auto-ws-first",
+            admin_token=admin_token,
+        )
+        first_id = first["call"]["id"]
+        first_token = first["callerToken"]
+        status, waiting = request_json(
+            self.base_url,
+            "POST",
+            f"/api/calls/{first_id}/ready",
+            headers={"X-Caller-Token": first_token},
+        )
+        self.assertEqual(status, 200, waiting)
+        self.assertEqual(waiting["call"]["status"], "waiting")
+        self.assertEqual(waiting["call"]["queuePosition"], 1)
+
+        status, ticket_payload = request_json(
+            self.base_url,
+            "POST",
+            "/api/auth/ws-ticket",
+            token=agent_token,
+        )
+        self.assertEqual(status, 200, ticket_payload)
+        ws_url = (
+            self.base_url.replace("http://", "ws://")
+            + "/ws?ticket="
+            + quote(ticket_payload["ticket"], safe="")
+        )
+
+        with websocket_connect(ws_url, open_timeout=3) as websocket:
+            snapshot = json.loads(websocket.recv(timeout=3))
+            self.assertEqual(snapshot["type"], "snapshot")
+            assigned_snapshot = next(
+                call for call in snapshot["calls"] if call["id"] == first_id
+            )
+            self.assertEqual(assigned_snapshot["status"], "connecting")
+            claimed_agent_id = assigned_snapshot["claimedAgentId"]
+            self.assertIsNotNone(claimed_agent_id)
+
+            status, assigned = request_json(
+                self.base_url,
+                "POST",
+                f"/api/calls/{first_id}/assignment",
+                token=agent_token,
+            )
+            self.assertEqual(status, 200, assigned)
+            self.assertEqual(assigned["call"]["claimedAgentId"], claimed_agent_id)
+            self.assertEqual(assigned["call"]["status"], "connecting")
+            self.assertNotIn("test-app-key", json.dumps(assigned))
+
+            status, forbidden = request_json(
+                self.base_url,
+                "POST",
+                f"/api/calls/{first_id}/assignment",
+                token=wrong_agent_token,
+            )
+            self.assertEqual(status, 403, forbidden)
+
+            second, _ = self.create_authenticated_call(
+                "caller-auto-ws-second",
+                admin_token=admin_token,
+            )
+            second_id = second["call"]["id"]
+            second_token = second["callerToken"]
+            status, second_ready = request_json(
+                self.base_url,
+                "POST",
+                f"/api/calls/{second_id}/ready",
+                headers={"X-Caller-Token": second_token},
+            )
+            self.assertEqual(status, 200, second_ready)
+            self.assertEqual(second_ready["call"]["status"], "waiting")
+            self.assertEqual(second_ready["call"]["queuePosition"], 1)
+            self.assertEqual(second_ready["call"]["queueSize"], 1)
+
+            status, hung_up = request_json(
+                self.base_url,
+                "POST",
+                f"/api/calls/{first_id}/hangup",
+                token=agent_token,
+            )
+            self.assertEqual(status, 200, hung_up)
+            status, second_view = request_json(
+                self.base_url,
+                "GET",
+                f"/api/calls/{second_id}",
+                headers={"X-Caller-Token": second_token},
+            )
+            self.assertEqual(status, 200, second_view)
+            self.assertEqual(second_view["call"]["status"], "connecting")
+            self.assertEqual(
+                second_view["call"]["claimedAgentId"],
+                claimed_agent_id,
+            )
+
     def test_private_network_cors_preflight_is_allowed(self) -> None:
         origin = "http://127.0.0.1:51947"
         request = Request(
@@ -517,13 +927,14 @@ class HttpContractTests(unittest.TestCase):
         status, payload = request_json(self.base_url, "GET", "/api/calls")
         self.assertEqual(status, 401, payload)
 
-        status, created = request_json(
+        status, unauthorized = request_json(
             self.base_url,
             "POST",
             "/api/calls",
             body={"client_id": "caller-invalid-token", "client_name": "无效凭证"},
         )
-        self.assertEqual(status, 200, created)
+        self.assertEqual(status, 401, unauthorized)
+        created, _ = self.create_authenticated_call("caller-invalid-token")
         status, payload = request_json(
             self.base_url,
             "POST",
@@ -534,13 +945,7 @@ class HttpContractTests(unittest.TestCase):
 
     def test_ten_concurrent_http_claims_only_one_succeeds(self) -> None:
         tokens = [self.login(f"agent{index:02d}") for index in range(3, 13)]
-        status, created = request_json(
-            self.base_url,
-            "POST",
-            "/api/calls",
-            body={"client_id": "caller-http-concurrent", "client_name": "并发呼叫"},
-        )
-        self.assertEqual(status, 200, created)
+        created, _ = self.create_authenticated_call("caller-http-concurrent")
         call_id = created["call"]["id"]
         caller_token = created["callerToken"]
         status, ready = request_json(
@@ -580,6 +985,127 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         relogin_token = self.login("agent13")
         self.assertNotEqual(token, relogin_token)
+
+    def test_admin_client_approval_and_directory_api(self) -> None:
+        admin_token = self.admin_login()
+        agent_token = self.login("agent17")
+        status, forbidden = request_json(
+            self.base_url,
+            "GET",
+            "/api/admin/clients",
+            token=agent_token,
+        )
+        self.assertEqual(status, 401, forbidden)
+        installation_uuid = str(uuid.uuid4())
+        status, registered = request_json(
+            self.base_url,
+            "POST",
+            "/api/clients/register",
+            body={
+                "installation_uuid": installation_uuid,
+                "display_name": "待审批客户端",
+            },
+        )
+        self.assertEqual(status, 200, registered)
+        client = registered["client"]
+        credential = registered["credential"]
+        self.assertEqual(client["status"], "pending")
+
+        status, directory = request_json(
+            self.base_url,
+            "GET",
+            "/api/clients",
+            token=agent_token,
+        )
+        self.assertEqual(status, 200, directory)
+        self.assertNotIn(
+            client["id"],
+            {item["id"] for item in directory["clients"]},
+        )
+
+        client_headers = {
+            "X-Installation-UUID": installation_uuid,
+            "X-Client-Credential": credential,
+        }
+        status, rejected = request_json(
+            self.base_url,
+            "POST",
+            f"/api/admin/clients/{client['id']}/reject",
+            token=admin_token,
+            body={"reason": "资料不完整"},
+        )
+        self.assertEqual(status, 200, rejected)
+        status, reregistered = request_json(
+            self.base_url,
+            "POST",
+            "/api/clients/reregister",
+            headers=client_headers,
+        )
+        self.assertEqual(status, 200, reregistered)
+        self.assertEqual(reregistered["client"]["status"], "pending")
+
+        status, approved = request_json(
+            self.base_url,
+            "POST",
+            f"/api/admin/clients/{client['id']}/approve",
+            token=admin_token,
+        )
+        self.assertEqual(status, 200, approved)
+
+        status, created = request_json(
+            self.base_url,
+            "POST",
+            "/api/calls",
+            body={"client_id": client["id"], "client_name": "待审批客户端"},
+            headers=client_headers,
+        )
+        self.assertEqual(status, 200, created)
+
+        status, directory = request_json(
+            self.base_url,
+            "GET",
+            "/api/clients",
+            token=agent_token,
+        )
+        self.assertEqual(status, 200, directory)
+        listed = next(
+            item for item in directory["clients"] if item["id"] == client["id"]
+        )
+        self.assertEqual(listed["availability"], "busy")
+
+        status, conflict = request_json(
+            self.base_url,
+            "POST",
+            f"/api/admin/clients/{client['id']}/disable",
+            token=admin_token,
+        )
+        self.assertEqual(status, 409, conflict)
+
+        status, created_agent = request_json(
+            self.base_url,
+            "POST",
+            "/api/admin/agents",
+            token=admin_token,
+            body={
+                "username": "agent-created",
+                "display_name": "新建客服",
+                "password": "agent123",
+            },
+        )
+        self.assertEqual(status, 200, created_agent)
+        created_agent_token = self.login("agent-created")
+        self.assertTrue(created_agent_token)
+
+        status, audit = request_json(
+            self.base_url,
+            "GET",
+            "/api/admin/audit",
+            token=admin_token,
+        )
+        self.assertEqual(status, 200, audit)
+        actions = {event["action"] for event in audit["events"]}
+        self.assertIn("client_approved", actions)
+        self.assertIn("agent_create", actions)
 
     def test_local_shutdown_endpoint_requires_control_token(self) -> None:
         self.app.state.shutdown_token = "shutdown-test-token"
@@ -631,13 +1157,10 @@ class HttpContractTests(unittest.TestCase):
 
     def test_agent_hangup_notifies_caller_and_ends_call(self) -> None:
         token = self.login("agent16")
-        status, created = request_json(
-            self.base_url,
-            "POST",
-            "/api/calls",
-            body={"client_id": "caller-hangup-ws", "client_name": "同步挂断"},
+        created, _ = self.create_authenticated_call(
+            "caller-hangup-ws",
+            admin_token=self.admin_login(),
         )
-        self.assertEqual(status, 200, created)
         call_id = created["call"]["id"]
         caller_token = created["callerToken"]
 
@@ -696,13 +1219,7 @@ class HttpContractTests(unittest.TestCase):
 
     def test_agent_websocket_disconnect_marks_call_interrupted(self) -> None:
         token = self.login("agent15")
-        status, created = request_json(
-            self.base_url,
-            "POST",
-            "/api/calls",
-            body={"client_id": "caller-ws-disconnect", "client_name": "断线呼叫"},
-        )
-        self.assertEqual(status, 200, created)
+        created, _ = self.create_authenticated_call("caller-ws-disconnect")
         call_id = created["call"]["id"]
         status, ready = request_json(
             self.base_url,

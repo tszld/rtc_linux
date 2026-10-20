@@ -9,6 +9,7 @@ from datetime import timedelta
 from typing import Any
 
 from .auth import AuthenticatedAgent
+from .clients import ClientIdentity
 from .config import ServerConfig
 from .db import (
     add_audit,
@@ -42,13 +43,20 @@ def _short_id() -> str:
     return uuid.uuid4().hex[:16]
 
 
-def call_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+def call_to_dict(
+    row: sqlite3.Row,
+    *,
+    queue_position: int | None = None,
+    queue_size: int | None = None,
+) -> dict[str, Any]:
     return {
         "id": row["id"],
         "roomId": row["room_id"],
         "callerId": row["caller_id"],
         "callerName": row["caller_name"],
         "status": row["status"],
+        "queuePosition": queue_position,
+        "queueSize": queue_size,
         "claimedAgentId": row["claimed_agent_id"],
         "interruptedSide": row["interrupted_side"],
         "createdAt": row["created_at"],
@@ -70,9 +78,43 @@ def _fetch_call(connection: sqlite3.Connection, call_id: str) -> sqlite3.Row:
     return row
 
 
+def _waiting_queue_positions(
+    connection: sqlite3.Connection,
+) -> dict[str, tuple[int, int]]:
+    rows = connection.execute(
+        """
+        SELECT id
+        FROM calls
+        WHERE status = 'waiting'
+        ORDER BY COALESCE(ready_at, created_at) ASC, created_at ASC, id ASC
+        """
+    ).fetchall()
+    queue_size = len(rows)
+    return {
+        row["id"]: (position, queue_size)
+        for position, row in enumerate(rows, start=1)
+    }
+
+
+def _call_with_queue(
+    connection: sqlite3.Connection, row: sqlite3.Row
+) -> dict[str, Any]:
+    queue_position = None
+    queue_size = None
+    if row["status"] == "waiting":
+        queue_position, queue_size = _waiting_queue_positions(connection).get(
+            row["id"], (None, 0)
+        )
+    return call_to_dict(
+        row,
+        queue_position=queue_position,
+        queue_size=queue_size,
+    )
+
+
 def get_call(config: ServerConfig, call_id: str) -> dict[str, Any]:
     with db_session(config) as connection:
-        return call_to_dict(_fetch_call(connection, call_id))
+        return _call_with_queue(connection, _fetch_call(connection, call_id))
 
 
 def verify_caller_token(
@@ -127,6 +169,95 @@ def create_call(
         return call_to_dict(row), caller_token, rtc_auth
 
 
+def create_call_for_client(
+    config: ServerConfig,
+    *,
+    client: ClientIdentity,
+) -> tuple[dict[str, Any], str, dict[str, str]]:
+    now = iso_time()
+    caller_token = secrets.token_urlsafe(36)
+    with db_session(config) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        client_row = connection.execute(
+            "SELECT id, display_name, status FROM clients WHERE id = ?",
+            (client.id,),
+        ).fetchone()
+        if not client_row or client_row["status"] != "approved":
+            raise CallError("客户端尚未通过管理员审批", 403)
+        client_name = client_row["display_name"]
+        existing = connection.execute(
+            """
+            SELECT *
+            FROM calls
+            WHERE caller_id = ?
+              AND status IN ('created', 'waiting', 'connecting', 'active', 'interrupted')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (client.id,),
+        ).fetchone()
+        if existing:
+            rtc_auth = make_rtc_auth(
+                config,
+                room_id=existing["room_id"],
+                user_id=existing["caller_uid"],
+                user_name=client_name,
+            )
+            connection.execute(
+                """
+                UPDATE calls
+                SET caller_token_hash = ?, caller_name = ?, updated_at = ?,
+                    version = version + 1
+                WHERE id = ?
+                """,
+                (
+                    hash_token(caller_token),
+                    client_name,
+                    now,
+                    existing["id"],
+                ),
+            )
+            add_audit(
+                connection,
+                existing["id"],
+                "caller_reauthenticated",
+                "caller",
+                client.id,
+            )
+            row = _fetch_call(connection, existing["id"])
+            return _call_with_queue(connection, row), caller_token, rtc_auth
+
+        call_id = "call-" + _short_id()
+        room_id = "room-" + _short_id()
+        caller_uid = "caller-" + _short_id()
+        rtc_auth = make_rtc_auth(
+            config,
+            room_id=room_id,
+            user_id=caller_uid,
+            user_name=client_name,
+        )
+        connection.execute(
+            """
+            INSERT INTO calls
+            (id, room_id, caller_id, caller_name, caller_uid, caller_token_hash,
+             status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'created', ?, ?)
+            """,
+            (
+                call_id,
+                room_id,
+                client.id,
+                client_name,
+                caller_uid,
+                hash_token(caller_token),
+                now,
+                now,
+            ),
+        )
+        add_audit(connection, call_id, "created", "caller", client.id)
+        return call_to_dict(_fetch_call(connection, call_id)), caller_token, rtc_auth
+
+
 def mark_caller_ready(
     config: ServerConfig, call_id: str, caller_token: str
 ) -> dict[str, Any]:
@@ -150,7 +281,7 @@ def mark_caller_ready(
             if row["status"] != "waiting":
                 raise CallError("当前会话不能进入等待状态")
         add_audit(connection, call_id, "caller_ready", "caller", None)
-        return call_to_dict(_fetch_call(connection, call_id))
+        return _call_with_queue(connection, _fetch_call(connection, call_id))
 
 
 def list_visible_calls(config: ServerConfig) -> list[dict[str, Any]]:
@@ -168,11 +299,120 @@ def list_visible_calls(config: ServerConfig) -> list[dict[str, Any]]:
                     WHEN 'active' THEN 2
                     ELSE 3
                 END,
-                created_at ASC
+                CASE
+                    WHEN status = 'waiting' THEN COALESCE(ready_at, created_at)
+                    ELSE created_at
+                END ASC,
+                id ASC
             """,
             VISIBLE_STATUSES,
         ).fetchall()
-        return [call_to_dict(row) for row in rows]
+        queue_positions = _waiting_queue_positions(connection)
+        return [
+            call_to_dict(
+                row,
+                queue_position=queue_positions.get(row["id"], (None, None))[0],
+                queue_size=queue_positions.get(row["id"], (None, None))[1],
+            )
+            for row in rows
+        ]
+
+
+def assign_waiting_calls(
+    config: ServerConfig,
+    agent_ids: list[str],
+) -> list[dict[str, Any]]:
+    connected_agent_ids = list(
+        dict.fromkeys(agent_id for agent_id in agent_ids if agent_id)
+    )
+    if not connected_agent_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in connected_agent_ids)
+    now = iso_time()
+    assigned: list[dict[str, Any]] = []
+    with db_session(config) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        agent_rows = connection.execute(
+            f"""
+            SELECT a.id, a.display_name
+            FROM agents AS a
+            WHERE a.id IN ({placeholders})
+              AND a.enabled = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM calls AS busy
+                  WHERE busy.claimed_agent_id = a.id
+                    AND busy.status IN ('connecting', 'active', 'interrupted')
+              )
+            """,
+            tuple(connected_agent_ids),
+        ).fetchall()
+        agents_by_id = {row["id"]: row for row in agent_rows}
+        agents = [
+            agents_by_id[agent_id]
+            for agent_id in connected_agent_ids
+            if agent_id in agents_by_id
+        ]
+
+        for agent in agents:
+            waiting = connection.execute(
+                """
+                SELECT *
+                FROM calls
+                WHERE status = 'waiting'
+                ORDER BY COALESCE(ready_at, created_at) ASC, created_at ASC, id ASC
+                LIMIT 1
+                """
+            ).fetchone()
+            if not waiting:
+                break
+            changed = connection.execute(
+                """
+                UPDATE calls
+                SET status = 'connecting',
+                    claimed_agent_id = ?,
+                    claimed_at = ?,
+                    connected_at = NULL,
+                    interrupted_side = NULL,
+                    interrupted_at = NULL,
+                    updated_at = ?,
+                    version = version + 1
+                WHERE id = ? AND status = 'waiting'
+                """,
+                (agent["id"], now, now, waiting["id"]),
+            ).rowcount
+            if not changed:
+                continue
+            add_audit(
+                connection,
+                waiting["id"],
+                "assigned",
+                "system",
+                agent["id"],
+            )
+            assigned.append(call_to_dict(_fetch_call(connection, waiting["id"])))
+    return assigned
+
+
+def get_assigned_call(
+    config: ServerConfig,
+    call_id: str,
+    agent: AuthenticatedAgent,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    with db_session(config) as connection:
+        row = _fetch_call(connection, call_id)
+        if row["claimed_agent_id"] != agent.id:
+            raise CallError("当前客服未被分配到该会话", 403)
+        if row["status"] != "connecting":
+            raise CallError("该派单已失效")
+        rtc_auth = make_rtc_auth(
+            config,
+            room_id=row["room_id"],
+            user_id=agent.id,
+            user_name=agent.display_name,
+        )
+        return call_to_dict(row), rtc_auth
 
 
 def claim_call(
@@ -397,16 +637,19 @@ def mark_agent_disconnected(config: ServerConfig, agent_id: str) -> list[str]:
 def mark_caller_disconnected(config: ServerConfig, call_id: str) -> bool:
     now = iso_time()
     with db_session(config) as connection:
+        connection.execute("BEGIN IMMEDIATE")
         changed = connection.execute(
             """
             UPDATE calls
-            SET status = 'interrupted',
-                interrupted_side = 'caller',
-                interrupted_at = ?,
+            SET status = 'ended',
+                interrupted_side = NULL,
+                interrupted_at = NULL,
+                ended_at = ?,
+                end_reason = 'caller_disconnected',
                 updated_at = ?,
                 version = version + 1
             WHERE id = ?
-              AND status IN ('waiting', 'connecting', 'active')
+              AND status IN ('created', 'waiting', 'connecting', 'active', 'interrupted')
             """,
             (now, now, call_id),
         ).rowcount

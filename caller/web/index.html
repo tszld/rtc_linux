@@ -19,8 +19,8 @@
     <section class="panel call-panel">
       <div class="fields">
         <label>
-          显示名称
-          <input id="displayName" maxlength="64" autocomplete="off">
+          客户端名称
+          <input id="displayName" maxlength="64" autocomplete="off" readonly>
         </label>
         <label>
           客户端编号
@@ -30,13 +30,14 @@
 
       <div class="call-state">
         <span id="stateBadge" class="badge idle">未呼叫</span>
-        <p id="statusText">点击开始呼叫后会发布本机麦克风音频。</p>
+        <p id="statusText">正在注册客户端并检查管理员审批状态。</p>
       </div>
 
       <div class="actions">
-        <button id="startCall" class="primary">发起呼叫</button>
+        <button id="startCall" class="primary" disabled>发起呼叫</button>
         <button id="mute" disabled>静音</button>
         <button id="shareScreen" disabled>共享屏幕</button>
+        <button id="reRegister" hidden>重新注册</button>
         <button id="resumeAudio" hidden>播放客服声音</button>
         <button id="hangup" class="danger" disabled>挂断</button>
       </div>
@@ -50,6 +51,10 @@
       <div class="session-row">
         <span>状态</span>
         <strong id="sessionStatus">-</strong>
+      </div>
+      <div class="session-row">
+        <span>客户端审批</span>
+        <strong id="clientApproval">检查中</strong>
       </div>
       <div class="session-row">
         <span>远端音频</span>

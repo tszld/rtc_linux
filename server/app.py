@@ -23,27 +23,65 @@ from .auth import (
     login_agent,
     logout_agent,
 )
+from .admin import (
+    AdminError,
+    AdminIdentity,
+    authenticate_admin,
+    create_agent,
+    list_admin_audit,
+    list_admin_clients,
+    list_agents,
+    login_admin,
+    logout_admin,
+    reset_agent_password,
+    reset_client_credential,
+    set_agent_enabled,
+    set_client_status,
+    update_agent_display_name,
+    update_client_display_name,
+)
 from .calls import (
     CallError,
     agent_hangup as agent_hangup_action,
+    assign_waiting_calls,
     claim_call,
     create_call,
+    create_call_for_client,
     end_call_by_caller,
     expire_calls,
     get_call,
+    get_assigned_call,
     list_visible_calls,
     mark_agent_connected,
     mark_agent_disconnected,
     mark_caller_disconnected,
     mark_caller_ready,
     resume_agent_call,
-    resume_caller,
     verify_caller_token,
     end_call,
 )
+from .clients import (
+    ClientError,
+    ClientIdentity,
+    authenticate_client,
+    client_self_payload,
+    list_approved_client_directory,
+    register_client,
+    request_client_reregistration,
+    require_approved_client,
+)
 from .config import ServerConfig, load_config
 from .db import initialize_database
-from .models import CreateCallRequest, LoginRequest, MessageResponse
+from .models import (
+    ClientRegisterRequest,
+    ClientStatusRequest,
+    CreateAgentRequest,
+    CreateCallRequest,
+    DisplayNameRequest,
+    LoginRequest,
+    MessageResponse,
+    ResetPasswordRequest,
+)
 from .rtc import RtcConfigurationError
 from .ws_manager import ConnectionManager
 
@@ -52,13 +90,23 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     settings = config or load_config()
     manager = ConnectionManager(settings)
 
+    async def dispatch_and_broadcast_calls() -> None:
+        assigned = assign_waiting_calls(
+            settings,
+            manager.connected_agent_ids(),
+        )
+        manager.note_assignments(assigned)
+        await manager.broadcast_calls()
+
     async def expiry_loop() -> None:
         while True:
             await asyncio.sleep(1)
             try:
                 changed = expire_calls(settings)
                 if changed:
+                    # 先让客服端看到超时后的 waiting/ended 状态，再开始下一轮派单。
                     await manager.broadcast_calls()
+                    await dispatch_and_broadcast_calls()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -95,6 +143,14 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     async def call_error_handler(_: Request, exc: CallError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
+    @app.exception_handler(AdminError)
+    async def admin_error_handler(_: Request, exc: AdminError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+    @app.exception_handler(ClientError)
+    async def client_error_handler(_: Request, exc: ClientError) -> JSONResponse:
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
     @app.exception_handler(RtcConfigurationError)
     async def rtc_error_handler(
         _: Request, exc: RtcConfigurationError
@@ -112,6 +168,25 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         return authenticate_access_token(settings, bearer_token(authorization))
 
     Agent = Annotated[AuthenticatedAgent, Depends(require_agent)]
+
+    def require_admin(
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> AdminIdentity:
+        return authenticate_admin(settings, bearer_token(authorization))
+
+    Admin = Annotated[AdminIdentity, Depends(require_admin)]
+
+    def require_client(
+        x_client_credential: Annotated[str | None, Header()] = None,
+        x_installation_uuid: Annotated[str | None, Header()] = None,
+    ) -> ClientIdentity:
+        return authenticate_client(
+            settings,
+            installation_uuid=x_installation_uuid or "",
+            credential=x_client_credential or "",
+        )
+
+    Client = Annotated[ClientIdentity, Depends(require_client)]
 
     @app.get("/api/health")
     def health() -> dict:
@@ -170,16 +245,62 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     def agent_ws_ticket(agent: Agent) -> dict:
         return {"ticket": manager.create_ticket("agent", agent.id)}
 
+    @app.post("/api/admin/login")
+    def admin_login(body: LoginRequest) -> dict:
+        token, admin = login_admin(
+            settings,
+            username=body.username.strip(),
+            password=body.password,
+        )
+        return {
+            "accessToken": token,
+            "admin": {"id": admin.id, "username": admin.username},
+        }
+
+    @app.post("/api/admin/logout", response_model=MessageResponse)
+    def admin_logout(admin: Admin) -> MessageResponse:
+        logout_admin(settings, admin.token_hash)
+        return MessageResponse(message="logged_out")
+
+    @app.post("/api/clients/register")
+    def client_register(
+        body: ClientRegisterRequest,
+        x_client_credential: Annotated[str | None, Header()] = None,
+    ) -> dict:
+        client, issued_credential = register_client(
+            settings,
+            installation_uuid=body.installation_uuid,
+            display_name=body.display_name,
+            credential=x_client_credential,
+        )
+        return {
+            "client": client,
+            "credential": issued_credential,
+        }
+
+    @app.get("/api/clients/me")
+    def client_me(client: Client) -> dict:
+        return {"client": client_self_payload(settings, client)}
+
+    @app.post("/api/clients/reregister")
+    def client_reregister(client: Client) -> dict:
+        return {"client": request_client_reregistration(settings, client)}
+
+    @app.get("/api/clients")
+    def client_directory(_: Agent) -> dict:
+        return {"clients": list_approved_client_directory(settings)}
+
     @app.get("/api/calls")
     def calls(_: Agent) -> dict:
         return {"calls": list_visible_calls(settings)}
 
     @app.post("/api/calls")
-    def create_new_call(body: CreateCallRequest) -> dict:
-        call, caller_token, rtc_auth = create_call(
+    def create_new_call(body: CreateCallRequest, client: Client) -> dict:
+        del body
+        approved = require_approved_client(client)
+        call, caller_token, rtc_auth = create_call_for_client(
             settings,
-            client_id=body.client_id.strip(),
-            client_name=body.client_name.strip(),
+            client=approved,
         )
         return {
             "call": call,
@@ -193,9 +314,9 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         call_id: str,
         x_caller_token: Annotated[str | None, Header()] = None,
     ) -> dict:
-        call = mark_caller_ready(settings, call_id, x_caller_token or "")
-        await manager.broadcast_calls()
-        return {"call": call}
+        mark_caller_ready(settings, call_id, x_caller_token or "")
+        await dispatch_and_broadcast_calls()
+        return {"call": get_call(settings, call_id)}
 
     @app.post("/api/calls/{call_id}/ws-ticket")
     def caller_ws_ticket(
@@ -219,31 +340,36 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         x_caller_token: Annotated[str | None, Header()] = None,
     ) -> dict:
         call = end_call_by_caller(settings, call_id, x_caller_token or "")
-        await manager.broadcast_calls()
+        await dispatch_and_broadcast_calls()
         return {"call": call}
 
     @app.post("/api/calls/{call_id}/claim")
     async def agent_claim(call_id: str, agent: Agent) -> dict:
         call, rtc_auth = claim_call(settings, call_id, agent)
-        await manager.broadcast_calls()
+        await dispatch_and_broadcast_calls()
+        return {"call": call, "rtc": rtc_auth}
+
+    @app.post("/api/calls/{call_id}/assignment")
+    def agent_assignment(call_id: str, agent: Agent) -> dict:
+        call, rtc_auth = get_assigned_call(settings, call_id, agent)
         return {"call": call, "rtc": rtc_auth}
 
     @app.post("/api/calls/{call_id}/connected")
     async def agent_connected(call_id: str, agent: Agent) -> dict:
         call = mark_agent_connected(settings, call_id, agent)
-        await manager.broadcast_calls()
+        await dispatch_and_broadcast_calls()
         return {"call": call}
 
     @app.post("/api/calls/{call_id}/hangup")
     async def agent_hangup_endpoint(call_id: str, agent: Agent) -> dict:
         call = agent_hangup_action(settings, call_id, agent)
-        await manager.broadcast_calls()
+        await dispatch_and_broadcast_calls()
         return {"call": call}
 
     @app.post("/api/calls/{call_id}/resume")
     async def agent_resume(call_id: str, agent: Agent) -> dict:
         call, rtc_auth = resume_agent_call(settings, call_id, agent)
-        await manager.broadcast_calls()
+        await dispatch_and_broadcast_calls()
         return {"call": call, "rtc": rtc_auth}
 
     @app.post("/api/calls/{call_id}/force-end")
@@ -257,8 +383,127 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         ):
             raise CallError("当前客服无权结束该会话", 403)
         ended = end_call(settings, call_id, "agent_force_end", "agent", agent.id)
-        await manager.broadcast_calls()
+        await dispatch_and_broadcast_calls()
         return {"call": ended}
+
+    @app.get("/api/admin/clients")
+    def admin_clients(
+        _: Admin,
+        status: str | None = Query(default=None),
+    ) -> dict:
+        return {"clients": list_admin_clients(settings, status=status)}
+
+    @app.patch("/api/admin/clients/{client_id}")
+    def admin_update_client(
+        client_id: str,
+        body: DisplayNameRequest,
+        admin: Admin,
+    ) -> MessageResponse:
+        update_client_display_name(
+            settings,
+            admin,
+            client_id=client_id,
+            display_name=body.display_name,
+        )
+        return MessageResponse(message="updated")
+
+    @app.post("/api/admin/clients/{client_id}/approve")
+    def admin_approve_client(client_id: str, admin: Admin) -> MessageResponse:
+        set_client_status(settings, admin, client_id=client_id, status="approved")
+        return MessageResponse(message="approved")
+
+    @app.post("/api/admin/clients/{client_id}/reject")
+    def admin_reject_client(
+        client_id: str,
+        admin: Admin,
+        body: ClientStatusRequest | None = None,
+    ) -> MessageResponse:
+        set_client_status(
+            settings,
+            admin,
+            client_id=client_id,
+            status="rejected",
+            reason=body.reason if body else None,
+        )
+        return MessageResponse(message="rejected")
+
+    @app.post("/api/admin/clients/{client_id}/disable")
+    def admin_disable_client(client_id: str, admin: Admin) -> MessageResponse:
+        set_client_status(settings, admin, client_id=client_id, status="disabled")
+        return MessageResponse(message="disabled")
+
+    @app.post("/api/admin/clients/{client_id}/enable")
+    def admin_enable_client(client_id: str, admin: Admin) -> MessageResponse:
+        set_client_status(settings, admin, client_id=client_id, status="approved")
+        return MessageResponse(message="enabled")
+
+    @app.post("/api/admin/clients/{client_id}/reset-credential")
+    def admin_reset_client_credential(
+        client_id: str,
+        admin: Admin,
+    ) -> MessageResponse:
+        reset_client_credential(settings, admin, client_id=client_id)
+        return MessageResponse(message="credential_reset")
+
+    @app.get("/api/admin/agents")
+    def admin_agents(_: Admin) -> dict:
+        return {"agents": list_agents(settings)}
+
+    @app.post("/api/admin/agents")
+    def admin_create_agent(
+        body: CreateAgentRequest,
+        admin: Admin,
+    ) -> dict:
+        agent = create_agent(
+            settings,
+            admin,
+            username=body.username,
+            display_name=body.display_name,
+            password=body.password,
+        )
+        return {"agent": agent}
+
+    @app.patch("/api/admin/agents/{agent_id}")
+    def admin_update_agent(
+        agent_id: str,
+        body: DisplayNameRequest,
+        admin: Admin,
+    ) -> MessageResponse:
+        update_agent_display_name(
+            settings,
+            admin,
+            agent_id=agent_id,
+            display_name=body.display_name,
+        )
+        return MessageResponse(message="updated")
+
+    @app.post("/api/admin/agents/{agent_id}/reset-password")
+    def admin_reset_agent_password(
+        agent_id: str,
+        body: ResetPasswordRequest,
+        admin: Admin,
+    ) -> MessageResponse:
+        reset_agent_password(
+            settings,
+            admin,
+            agent_id=agent_id,
+            password=body.password,
+        )
+        return MessageResponse(message="password_reset")
+
+    @app.post("/api/admin/agents/{agent_id}/disable")
+    def admin_disable_agent(agent_id: str, admin: Admin) -> MessageResponse:
+        set_agent_enabled(settings, admin, agent_id=agent_id, enabled=False)
+        return MessageResponse(message="disabled")
+
+    @app.post("/api/admin/agents/{agent_id}/enable")
+    def admin_enable_agent(agent_id: str, admin: Admin) -> MessageResponse:
+        set_agent_enabled(settings, admin, agent_id=agent_id, enabled=True)
+        return MessageResponse(message="enabled")
+
+    @app.get("/api/admin/audit")
+    def admin_audit(_: Admin, limit: int = Query(default=200, ge=1, le=1000)) -> dict:
+        return {"events": list_admin_audit(settings, limit=limit)}
 
     @app.websocket("/ws")
     async def websocket_endpoint(
@@ -276,6 +521,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if consumed:
             agent_id = consumed.identity
             await manager.register_agent(agent_id, websocket)
+            await dispatch_and_broadcast_calls()
             try:
                 while True:
                     message = await websocket.receive_text()
@@ -284,19 +530,16 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             except WebSocketDisconnect:
                 removed = await manager.unregister_agent(agent_id, websocket)
                 if removed and mark_agent_disconnected(settings, agent_id):
-                    await manager.broadcast_calls()
+                    await dispatch_and_broadcast_calls()
             except Exception:
                 removed = await manager.unregister_agent(agent_id, websocket)
                 if removed and mark_agent_disconnected(settings, agent_id):
-                    await manager.broadcast_calls()
+                    await dispatch_and_broadcast_calls()
             return
 
         assert caller_ticket is not None
         call_id = caller_ticket.identity
         await manager.register_caller(call_id, websocket)
-        resumed = resume_caller(settings, call_id)
-        if resumed:
-            await manager.broadcast_calls()
         try:
             while True:
                 message = await websocket.receive_text()
@@ -305,11 +548,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         except WebSocketDisconnect:
             removed = await manager.unregister_caller(call_id, websocket)
             if removed and mark_caller_disconnected(settings, call_id):
-                await manager.broadcast_calls()
+                await dispatch_and_broadcast_calls()
         except Exception:
             removed = await manager.unregister_caller(call_id, websocket)
             if removed and mark_caller_disconnected(settings, call_id):
-                await manager.broadcast_calls()
+                await dispatch_and_broadcast_calls()
 
     return app
 

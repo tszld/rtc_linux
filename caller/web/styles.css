@@ -204,7 +204,7 @@ button.danger {
 
 .session-panel {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 16px;
   margin-top: 16px;
   padding: 18px 24px;

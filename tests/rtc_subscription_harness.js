@@ -193,7 +193,11 @@ function loadAgentSandbox(dingRtc) {
       process,
       QWebChannel: QWebChannelMock,
       qt: { webChannelTransport: {} },
-      setInterval,
+      setInterval: (callback, delay) => {
+        const timer = setInterval(callback, Math.min(delay, 50));
+        timer.unref();
+        return timer;
+      },
       setTimeout,
       window: {
         DingRTC: dingRtc.sdk,
@@ -203,17 +207,212 @@ function loadAgentSandbox(dingRtc) {
   };
 }
 
+function loadCallerRegistrationSandbox() {
+  const document = createDocument();
+  const savedCredentials = [];
+  let registrationCount = 0;
+  const nativeSetTimeout = setTimeout;
+  return {
+    sandbox: {
+      clearInterval,
+      clearTimeout,
+      console,
+      document,
+      async fetch(url, options = {}) {
+        url = String(url);
+        if (url === "/config.json") {
+          return {
+            ok: true,
+            async json() {
+              return {
+                backendUrl: "http://127.0.0.1:8000",
+                defaultName: "注册测试客户端",
+                installationUuid: "11111111-1111-4111-8111-111111111111",
+                clientCredential: null,
+              };
+            },
+          };
+        }
+        if (url.endsWith("/api/health")) {
+          return {
+            ok: true,
+            async json() {
+              return { ok: true, rtcConfigured: true };
+            },
+          };
+        }
+        if (url === "/client-credential") {
+          savedCredentials.push(JSON.parse(options.body).client_credential);
+          return {
+            ok: true,
+            async json() {
+              return { ok: true };
+            },
+          };
+        }
+        if (url.endsWith("/api/clients/register")) {
+          registrationCount += 1;
+          return {
+            ok: true,
+            async json() {
+              return {
+                client: {
+                  id: "client-registration-test",
+                  displayName: "注册测试客户端",
+                  status: registrationCount === 1 ? "pending" : "approved",
+                },
+                credential: registrationCount === 1 ? "credential-1" : null,
+              };
+            },
+          };
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      },
+      process,
+      setInterval,
+      setTimeout: (callback, delay, ...args) =>
+        nativeSetTimeout(callback, Math.min(delay, 10), ...args),
+      testDelay: (delay) =>
+        new Promise((resolve) => nativeSetTimeout(resolve, delay)),
+      WebSocket: class {
+        static OPEN = 1;
+      },
+      window: {
+        DingRTC: { default: {} },
+        addEventListener() {},
+      },
+    },
+    savedCredentials,
+  };
+}
+
+function loadCallerRegistrationRecoverySandbox() {
+  const document = createDocument();
+  document.getElementById("reRegister").hidden = true;
+  const savedCredentials = [];
+  const state = {
+    registrationCount: 0,
+    resetCount: 0,
+  };
+  const nativeSetTimeout = setTimeout;
+  return {
+    sandbox: {
+      clearInterval,
+      clearTimeout,
+      console,
+      document,
+      async fetch(url, options = {}) {
+        url = String(url);
+        if (url === "/config.json") {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                backendUrl: "http://127.0.0.1:8000",
+                defaultName: "失效凭证客户端",
+                installationUuid: "11111111-1111-4111-8111-111111111111",
+                clientCredential: "invalid-credential",
+              };
+            },
+          };
+        }
+        if (url.endsWith("/api/health")) {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return { ok: true, rtcConfigured: true };
+            },
+          };
+        }
+        if (url.endsWith("/api/clients/register")) {
+          state.registrationCount += 1;
+          if (state.registrationCount === 1) {
+            return {
+              ok: false,
+              status: 403,
+              async json() {
+                return { detail: "客户端设备凭证无效" };
+              },
+            };
+          }
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                client: {
+                  id: "client-after-reset",
+                  displayName: "失效凭证客户端",
+                  status: "pending",
+                },
+                credential: "credential-after-reset",
+              };
+            },
+          };
+        }
+        if (url === "/client-reset-identity") {
+          state.resetCount += 1;
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                installationUuid: "22222222-2222-4222-8222-222222222222",
+                clientCredential: null,
+              };
+            },
+          };
+        }
+        if (url === "/client-credential") {
+          savedCredentials.push(JSON.parse(options.body).client_credential);
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return { ok: true };
+            },
+          };
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      },
+      process,
+      setInterval,
+      setTimeout: (callback, delay, ...args) => {
+        const timer = nativeSetTimeout(callback, delay, ...args);
+        timer.unref();
+        return timer;
+      },
+      testDelay: (delay) =>
+        new Promise((resolve) => nativeSetTimeout(resolve, delay)),
+      WebSocket: class {
+        static OPEN = 1;
+      },
+      window: {
+        DingRTC: { default: {} },
+        addEventListener() {},
+      },
+    },
+    savedCredentials,
+    state,
+  };
+}
+
 async function run() {
   if (
     caseName !== "caller" &&
+    caseName !== "caller-registration" &&
+    caseName !== "caller-registration-recovery" &&
     caseName !== "agent" &&
     caseName !== "caller-screen" &&
     caseName !== "caller-audio-retry" &&
     caseName !== "agent-audio-retry" &&
-    caseName !== "agent-screen-retry"
+    caseName !== "agent-screen-retry" &&
+    caseName !== "agent-screen-discovery"
   ) {
     throw new Error(
-      "usage: node rtc_subscription_harness.js caller|agent|caller-screen|caller-audio-retry|agent-audio-retry|agent-screen-retry",
+      "usage: node rtc_subscription_harness.js caller|caller-registration|caller-registration-recovery|agent|caller-screen|caller-audio-retry|agent-audio-retry|agent-screen-retry|agent-screen-discovery",
     );
   }
 
@@ -228,14 +427,108 @@ async function run() {
   const loaded =
     caseName.startsWith("agent")
       ? loadAgentSandbox(dingRtc)
-      : loadCallerSandbox(dingRtc);
+      : caseName === "caller-registration"
+        ? loadCallerRegistrationSandbox()
+        : caseName === "caller-registration-recovery"
+          ? loadCallerRegistrationRecoverySandbox()
+        : loadCallerSandbox(dingRtc);
   loaded.sandbox.subscriptionCalls = dingRtc.subscribed;
   loaded.sandbox.publishedTracks = dingRtc.published;
   loaded.sandbox.unpublishedTracks = dingRtc.unpublished;
+  if (loaded.savedCredentials) {
+    loaded.sandbox.savedCredentials = loaded.savedCredentials;
+  }
+  if (loaded.state) {
+    loaded.sandbox.recoveryState = loaded.state;
+  }
   const context = vm.createContext(loaded.sandbox);
   const source = fs.readFileSync(sourcePath, "utf8");
   const assertion =
-    caseName === "caller-screen"
+    caseName === "caller-registration"
+      ? `
+    ;(async () => {
+      try {
+        await testDelay(100);
+        if (
+          document.getElementById("clientApproval").textContent !== "已批准" ||
+          document.getElementById("clientId").value !== "client-registration-test" ||
+          document.getElementById("startCall").disabled ||
+          document.getElementById("displayName").value !== "注册测试客户端" ||
+          !document.getElementById("displayName").readOnly ||
+          !document.getElementById("reRegister").hidden
+        ) {
+          throw new Error(
+            "caller registration did not reach approved state: " +
+            JSON.stringify({
+              approval: document.getElementById("clientApproval").textContent,
+              clientId: document.getElementById("clientId").value,
+              startDisabled: document.getElementById("startCall").disabled,
+              displayName: document.getElementById("displayName").value,
+              displayNameReadOnly:
+                document.getElementById("displayName").readOnly,
+              errorText: document.getElementById("errorText").textContent,
+            }),
+          );
+        }
+        if (savedCredentials[0] !== "credential-1") {
+          throw new Error("client credential was not persisted");
+        }
+      } catch (error) {
+        console.error(error.stack || error.message || String(error));
+        process.exitCode = 1;
+      }
+    })();
+  `
+      : caseName === "caller-registration-recovery"
+        ? `
+    ;(async () => {
+      try {
+        await testDelay(50);
+        const recoveryButton = document.getElementById("reRegister");
+        if (
+          recoveryButton.hidden ||
+          recoveryButton.textContent !== "重新注册" ||
+          document.getElementById("clientApproval").textContent !== "注册失败"
+        ) {
+          throw new Error(
+            "invalid credential did not expose registration recovery: " +
+            JSON.stringify({
+              hidden: recoveryButton.hidden,
+              text: recoveryButton.textContent,
+              approval: document.getElementById("clientApproval").textContent,
+              errorText: document.getElementById("errorText").textContent,
+            }),
+          );
+        }
+        await reregisterClient();
+        await testDelay(50);
+        if (
+          recoveryState.resetCount !== 1 ||
+          recoveryState.registrationCount !== 2 ||
+          document.getElementById("clientApproval").textContent !==
+            "等待管理员审批" ||
+          document.getElementById("clientId").value !== "client-after-reset" ||
+          savedCredentials[0] !== "credential-after-reset"
+        ) {
+          throw new Error(
+            "registration recovery did not issue a new pending identity: " +
+            JSON.stringify({
+              resetCount: recoveryState.resetCount,
+              registrationCount: recoveryState.registrationCount,
+              approval: document.getElementById("clientApproval").textContent,
+              clientId: document.getElementById("clientId").value,
+              savedCredentials,
+              errorText: document.getElementById("errorText").textContent,
+            }),
+          );
+        }
+      } catch (error) {
+        console.error(error.stack || error.message || String(error));
+        process.exitCode = 1;
+      }
+    })();
+  `
+      : caseName === "caller-screen"
       ? `
     ;(async () => {
       try {
@@ -289,6 +582,30 @@ async function run() {
           throw new Error(
             "screen subscription did not recover after retry, calls=" +
             JSON.stringify(subscriptionCalls),
+          );
+        }
+      } catch (error) {
+        console.error(error.stack || error.message || String(error));
+        process.exitCode = 1;
+      }
+    })();
+  `
+        : caseName === "agent-screen-discovery"
+          ? `
+    ;(async () => {
+      try {
+        buildClient();
+        client.remoteUsers.push({
+          userId: "caller-discovery",
+          hasAuxiliary: true,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 180));
+        if (
+          !remoteTracks.has("screen:caller-discovery") ||
+          document.getElementById("screenState").textContent !== "正在播放"
+        ) {
+          throw new Error(
+            "screen discovery did not subscribe without user-published event",
           );
         }
       } catch (error) {

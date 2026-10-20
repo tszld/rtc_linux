@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, QUrl, QUrlQuery, Signal
 from PySide6.QtWebSockets import QWebSocket
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -35,7 +37,19 @@ from agent.rtc_panel import RtcPanel
 
 
 AGENT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = Path(os.getenv("RTC_AGENT_CONFIG", AGENT_DIR / "config.json"))
+ROOT_DIR = AGENT_DIR.parent
+
+
+def resolve_agent_config_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = ROOT_DIR / path
+    return path.resolve()
+
+
+CONFIG_PATH = resolve_agent_config_path(
+    os.getenv("RTC_AGENT_CONFIG", AGENT_DIR / "config.json")
+)
 
 
 def load_agent_config() -> dict:
@@ -71,6 +85,27 @@ STATUS_LABELS = {
     "active": "通话中",
     "interrupted": "连接异常",
     "ended": "已结束",
+}
+
+
+def find_assigned_call(calls: list[dict], agent_id: str) -> dict | None:
+    return next(
+        (
+            call
+            for call in calls
+            if call.get("status") == "connecting"
+            and call.get("claimedAgentId") == agent_id
+            and call.get("connectedAt") is None
+        ),
+        None,
+    )
+
+
+ADMIN_CLIENT_STATUS_LABELS = {
+    "pending": "待审批",
+    "approved": "已批准",
+    "rejected": "已拒绝",
+    "disabled": "已停用",
 }
 
 
@@ -133,7 +168,7 @@ class AgentWebSocket(QObject):
 
 
 class LoginPage(QWidget):
-    login_requested = Signal(str, str)
+    login_requested = Signal(str, str, str)
 
     def __init__(self, backend_url: str, parent: QWidget | None = None):
         super().__init__(parent)
@@ -153,17 +188,22 @@ class LoginPage(QWidget):
 
         title = QLabel("客服工作台")
         title.setObjectName("loginTitle")
-        subtitle = QLabel("登录后查看等待和已占用的通话房间")
+        subtitle = QLabel("登录后空闲客服会自动接收到系统派单")
         subtitle.setObjectName("mutedText")
         subtitle.setWordWrap(True)
         card_layout.addWidget(title)
         card_layout.addWidget(subtitle)
         card_layout.addSpacing(14)
 
-        username_label = QLabel("客服账号")
+        role_label = QLabel("登录身份")
+        role_label.setObjectName("fieldLabel")
+        self.role = QComboBox()
+        self.role.addItem("客服登录", "agent")
+        self.role.addItem("管理员登录", "admin")
+        username_label = QLabel("登录账号")
         username_label.setObjectName("fieldLabel")
         self.username = QLineEdit()
-        self.username.setPlaceholderText("客服账号")
+        self.username.setPlaceholderText("登录账号")
         self.username.setMaxLength(64)
         password_label = QLabel("密码")
         password_label.setObjectName("fieldLabel")
@@ -182,6 +222,8 @@ class LoginPage(QWidget):
         server.setWordWrap(True)
         server.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        card_layout.addWidget(role_label)
+        card_layout.addWidget(self.role)
         card_layout.addWidget(username_label)
         card_layout.addWidget(self.username)
         card_layout.addWidget(password_label)
@@ -204,10 +246,11 @@ class LoginPage(QWidget):
         if not username or not password:
             self.show_error("请输入客服账号和密码")
             return
-        self.login_requested.emit(username, password)
+        self.login_requested.emit(self.role.currentData(), username, password)
 
     def set_busy(self, busy: bool) -> None:
         self.login_button.setEnabled(not busy)
+        self.role.setEnabled(not busy)
         self.username.setEnabled(not busy)
         self.password.setEnabled(not busy)
         self.login_button.setText("正在登录..." if busy else "登录")
@@ -221,13 +264,16 @@ class AgentWindow(QMainWindow):
         super().__init__()
         self.backend_url = backend_url
         self.setWindowTitle("RTC 客服工作台")
-        self.resize(1180, 760)
-        self.setMinimumSize(980, 640)
+        self.resize(1280, 800)
+        self.setMinimumSize(1024, 640)
 
         self.api = ApiClient(backend_url, self)
         self.token: str | None = None
+        self.admin_token: str | None = None
         self.agent: dict | None = None
+        self.admin: dict | None = None
         self.calls: dict[str, dict] = {}
+        self.clients: dict[str, dict] = {}
         self.current_call: dict | None = None
         self.websocket: AgentWebSocket | None = None
         self.reconnect_timer: QTimer | None = None
@@ -240,8 +286,10 @@ class AgentWindow(QMainWindow):
         self.setCentralWidget(self.stack)
         self.login_page = LoginPage(backend_url)
         self.dashboard = self._build_dashboard()
+        self.admin_dashboard = self._build_admin_dashboard()
         self.stack.addWidget(self.login_page)
         self.stack.addWidget(self.dashboard)
+        self.stack.addWidget(self.admin_dashboard)
         self.login_page.login_requested.connect(self.login)
 
         self.heartbeat_timer = QTimer(self)
@@ -255,6 +303,12 @@ class AgentWindow(QMainWindow):
         self.table_timer = QTimer(self)
         self.table_timer.setInterval(1000)
         self.table_timer.timeout.connect(self.render_calls)
+        self.client_timer = QTimer(self)
+        self.client_timer.setInterval(5000)
+        self.client_timer.timeout.connect(self.refresh_clients)
+        self.admin_timer = QTimer(self)
+        self.admin_timer.setInterval(5000)
+        self.admin_timer.timeout.connect(self.refresh_admin_data)
 
         self._apply_style()
 
@@ -287,19 +341,45 @@ class AgentWindow(QMainWindow):
         header.addWidget(self.logout_button)
         root.addLayout(header)
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(12)
+        self.dashboard_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.dashboard_splitter.setChildrenCollapsible(False)
+        self.dashboard_splitter.setHandleWidth(10)
 
         left = QFrame()
         left.setObjectName("sectionFrame")
-        left.setMinimumWidth(520)
+        left.setMinimumWidth(380)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(16, 15, 16, 16)
         left_layout.setSpacing(8)
-        list_title = QLabel("通话房间")
-        list_title.setObjectName("sectionTitle")
-        self.list_hint = QLabel("等待接听的房间会排在最前面")
+
+        self.dashboard_tabs = QTabWidget()
+        clients_page = QWidget()
+        clients_layout = QVBoxLayout(clients_page)
+        clients_layout.setContentsMargins(0, 8, 0, 0)
+        self.client_hint = QLabel("已批准客户端")
+        self.client_hint.setObjectName("mutedText")
+        self.client_table = QTableWidget(0, 4)
+        self.client_table.setHorizontalHeaderLabels(
+            ["客户端名称", "客户端 ID", "状态", "当前会话"]
+        )
+        self.client_table.verticalHeader().setVisible(False)
+        self.client_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.client_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.client_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        client_header = self.client_table.horizontalHeader()
+        client_header.setStretchLastSection(False)
+        client_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        client_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.client_table.setColumnWidth(1, 170)
+        self.client_table.setColumnWidth(2, 80)
+        self.client_table.setColumnWidth(3, 150)
+        clients_layout.addWidget(self.client_hint)
+        clients_layout.addWidget(self.client_table, 1)
+
+        calls_page = QWidget()
+        calls_layout = QVBoxLayout(calls_page)
+        calls_layout.setContentsMargins(0, 8, 0, 0)
+        self.list_hint = QLabel("系统会按呼入顺序自动分配给空闲客服")
         self.list_hint.setObjectName("mutedText")
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
@@ -320,28 +400,30 @@ class AgentWindow(QMainWindow):
         self.table.setColumnWidth(2, 92)
         self.table.setColumnWidth(3, 140)
         self.table.setColumnWidth(4, 86)
-        left_layout.addWidget(list_title)
-        left_layout.addWidget(self.list_hint)
-        left_layout.addWidget(self.table, 1)
+        calls_layout.addWidget(self.list_hint)
+        calls_layout.addWidget(self.table, 1)
+        self.dashboard_tabs.addTab(clients_page, "客户端")
+        self.dashboard_tabs.addTab(calls_page, "通话房间")
+        left_layout.addWidget(self.dashboard_tabs, 1)
 
         right = QFrame()
         right.setObjectName("sectionFrame")
-        right.setMinimumWidth(350)
+        right.setMinimumWidth(500)
         right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(16, 15, 16, 16)
-        right_layout.setSpacing(8)
+        right_layout.setContentsMargins(12, 12, 12, 12)
+        right_layout.setSpacing(6)
         right_title = QLabel("当前通话")
         right_title.setObjectName("sectionTitle")
         self.current_status = QLabel("尚未接听")
         self.current_status.setObjectName("currentStatus")
-        self.current_session = QLabel("从左侧选择一个等待中的房间")
+        self.current_session = QLabel("当前空闲，等待系统派单")
         self.current_session.setObjectName("mutedText")
         self.current_session.setWordWrap(True)
         self.remote_state = QLabel("")
         self.remote_state.setObjectName("remoteState")
         self.remote_state.setWordWrap(True)
         self.rtc_panel = RtcPanel()
-        self.rtc_panel.setMinimumHeight(320)
+        self.rtc_panel.setMinimumHeight(360)
         self.rtc_panel.hide()
         self.rtc_panel.event_received.connect(self.on_rtc_event)
         controls = QHBoxLayout()
@@ -366,12 +448,137 @@ class AgentWindow(QMainWindow):
         right_layout.addWidget(self.rtc_panel, 1)
         right_layout.addLayout(controls)
 
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([700, 420])
-        root.addWidget(splitter, 1)
+        self.dashboard_splitter.addWidget(left)
+        self.dashboard_splitter.addWidget(right)
+        self.dashboard_splitter.setStretchFactor(0, 2)
+        self.dashboard_splitter.setStretchFactor(1, 3)
+        self.dashboard_splitter.setSizes([430, 760])
+        root.addWidget(self.dashboard_splitter, 1)
+        return page
+
+    def _build_admin_dashboard(self) -> QWidget:
+        page = QWidget()
+        page.setObjectName("dashboardPage")
+        root = QVBoxLayout(page)
+        root.setContentsMargins(24, 20, 24, 22)
+        root.setSpacing(14)
+
+        header = QHBoxLayout()
+        title_block = QVBoxLayout()
+        title_block.setSpacing(2)
+        title = QLabel("RTC 管理平台")
+        title.setObjectName("pageTitle")
+        self.admin_label = QLabel("未登录")
+        self.admin_label.setObjectName("mutedText")
+        title_block.addWidget(title)
+        title_block.addWidget(self.admin_label)
+        self.admin_logout_button = QPushButton("退出登录")
+        self.admin_logout_button.setObjectName("secondaryButton")
+        self.admin_logout_button.clicked.connect(self.admin_logout)
+        refresh = QPushButton("刷新")
+        refresh.clicked.connect(self.refresh_admin_data)
+        header.addLayout(title_block)
+        header.addStretch(1)
+        header.addWidget(refresh)
+        header.addWidget(self.admin_logout_button)
+        root.addLayout(header)
+
+        tabs = QTabWidget()
+
+        clients_page = QWidget()
+        clients_layout = QVBoxLayout(clients_page)
+        client_actions = QHBoxLayout()
+        for text, handler in (
+            ("批准", self.approve_selected_client),
+            ("拒绝", self.reject_selected_client),
+            ("停用", self.disable_selected_client),
+            ("恢复", self.enable_selected_client),
+            ("改名", self.rename_selected_client),
+            ("重置凭证", self.reset_selected_client_credential),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(handler)
+            client_actions.addWidget(button)
+        client_actions.addStretch(1)
+        self.admin_clients_table = QTableWidget(0, 5)
+        self.admin_clients_table.setHorizontalHeaderLabels(
+            ["显示名称", "客户端 ID", "审批状态", "占用", "安装 UUID"]
+        )
+        self.admin_clients_table.verticalHeader().setVisible(False)
+        self.admin_clients_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.admin_clients_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.admin_clients_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        header_view = self.admin_clients_table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        clients_layout.addLayout(client_actions)
+        clients_layout.addWidget(self.admin_clients_table, 1)
+
+        agents_page = QWidget()
+        agents_layout = QVBoxLayout(agents_page)
+        agent_actions = QHBoxLayout()
+        for text, handler in (
+            ("新建客服", self.create_agent_account),
+            ("修改显示名", self.rename_selected_agent),
+            ("重置密码", self.reset_selected_agent_password),
+            ("停用", self.disable_selected_agent),
+            ("启用", self.enable_selected_agent),
+        ):
+            button = QPushButton(text)
+            button.clicked.connect(handler)
+            agent_actions.addWidget(button)
+        agent_actions.addStretch(1)
+        self.admin_agents_table = QTableWidget(0, 4)
+        self.admin_agents_table.setHorizontalHeaderLabels(
+            ["客服账号", "显示名称", "状态", "创建时间"]
+        )
+        self.admin_agents_table.verticalHeader().setVisible(False)
+        self.admin_agents_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.admin_agents_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.admin_agents_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
+        self.admin_agents_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        agents_layout.addLayout(agent_actions)
+        agents_layout.addWidget(self.admin_agents_table, 1)
+
+        audit_page = QWidget()
+        audit_layout = QVBoxLayout(audit_page)
+        self.admin_audit_table = QTableWidget(0, 5)
+        self.admin_audit_table.setHorizontalHeaderLabels(
+            ["时间", "操作", "目标类型", "目标 ID", "详情"]
+        )
+        self.admin_audit_table.verticalHeader().setVisible(False)
+        self.admin_audit_table.setEditTriggers(
+            QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self.admin_audit_table.setSelectionMode(
+            QTableWidget.SelectionMode.NoSelection
+        )
+        audit_header = self.admin_audit_table.horizontalHeader()
+        audit_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        audit_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        audit_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        audit_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        audit_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        audit_layout.addWidget(self.admin_audit_table, 1)
+
+        tabs.addTab(clients_page, "客户端审批")
+        tabs.addTab(agents_page, "客服账号")
+        tabs.addTab(audit_page, "管理审计")
+        root.addWidget(tabs, 1)
         return page
 
     def _apply_style(self) -> None:
@@ -430,6 +637,29 @@ class AgentWindow(QMainWindow):
             }
             QLineEdit:focus {
                 border: 1px solid #2563eb;
+            }
+            QComboBox {
+                min-height: 38px;
+                padding: 0 10px;
+                border: 1px solid #cfd8e3;
+                border-radius: 6px;
+                background: white;
+            }
+            QTabWidget::pane {
+                border: 0;
+                background: white;
+            }
+            QTabBar::tab {
+                min-width: 96px;
+                padding: 8px 14px;
+                border-bottom: 2px solid transparent;
+                background: transparent;
+                color: #667085;
+                font-weight: 600;
+            }
+            QTabBar::tab:selected {
+                border-bottom-color: #2563eb;
+                color: #1d4ed8;
             }
             QPushButton {
                 min-height: 36px;
@@ -516,15 +746,44 @@ class AgentWindow(QMainWindow):
             """
         )
 
-    def login(self, username: str, password: str) -> None:
+    def login(self, role: str, username: str, password: str) -> None:
         self.login_page.set_busy(True)
         self.login_page.show_error("")
+        if role == "admin":
+            self.api.request(
+                "POST",
+                "/api/admin/login",
+                body={"username": username, "password": password},
+                callback=self._on_admin_login,
+            )
+            return
         self.api.request(
             "POST",
             "/api/auth/login",
             body={"username": username, "password": password},
             callback=self._on_login,
         )
+
+    def _on_admin_login(
+        self,
+        ok: bool,
+        status: int,
+        payload: dict | None,
+    ) -> None:
+        self.login_page.set_busy(False)
+        if not ok:
+            message = (payload or {}).get("detail", f"登录失败，HTTP {status}")
+            self.login_page.show_error(str(message))
+            return
+        self.admin_token = (payload or {}).get("accessToken")
+        self.admin = (payload or {}).get("admin")
+        if not self.admin_token or not self.admin:
+            self.login_page.show_error("管理员登录响应不完整")
+            return
+        self.admin_label.setText(f"超级管理员 · {self.admin['username']}")
+        self.stack.setCurrentWidget(self.admin_dashboard)
+        self.admin_timer.start()
+        self.refresh_admin_data()
 
     def _on_login(self, ok: bool, status: int, payload: dict | None) -> None:
         self.login_page.set_busy(False)
@@ -546,6 +805,9 @@ class AgentWindow(QMainWindow):
         self.heartbeat_timer.start()
         self.ws_ping_timer.start()
         self.table_timer.start()
+        self.client_timer.start()
+        self.dashboard_tabs.setCurrentIndex(0)
+        self.refresh_clients()
 
     def open_websocket(self) -> None:
         if not self.token or not self.reconnect_enabled:
@@ -611,6 +873,28 @@ class AgentWindow(QMainWindow):
             return
         calls = payload.get("calls") or []
         self.calls = {call["id"]: call for call in calls}
+        if self.current_call:
+            updated = self.calls.get(self.current_call["id"])
+            if not updated:
+                self.finish_current_local("会话已结束")
+            else:
+                self.current_call = updated
+                self.update_current_call()
+            if updated and updated["status"] == "ended":
+                self.finish_current_local("会话已结束")
+            elif (
+                self.current_call
+                and updated["status"] == "waiting"
+                and updated.get("claimedAgentId") is None
+            ):
+                self.finish_current_local("接听超时，请重新接听")
+            elif (
+                self.current_call
+                and updated["status"] == "interrupted"
+                and updated.get("claimedAgentId") == self.agent["id"]
+                and updated.get("interruptedSide") == "agent"
+            ):
+                self.try_resume_current()
         if not self.current_call and self.agent:
             interrupted = next(
                 (
@@ -630,27 +914,55 @@ class AgentWindow(QMainWindow):
                 self.hangup_button.setEnabled(True)
                 self.remote_state.setText("检测到中断会话，正在恢复 RTC")
                 self.update_current_call()
-        if self.current_call:
-            updated = self.calls.get(self.current_call["id"])
-            if not updated:
-                self.finish_current_local("会话已结束")
-                return
-            self.current_call = updated
-            self.update_current_call()
-            if (
-                updated["status"] == "waiting"
-                and updated.get("claimedAgentId") is None
-            ):
-                self.finish_current_local("接听超时，请重新接听")
-                self.render_calls()
-                return
-            if (
-                updated["status"] == "interrupted"
-                and updated.get("claimedAgentId") == self.agent["id"]
-                and updated.get("interruptedSide") == "agent"
-            ):
                 self.try_resume_current()
+            else:
+                self.accept_assigned_call()
         self.render_calls()
+        self.refresh_clients()
+
+    def refresh_clients(self) -> None:
+        if not self.token:
+            return
+        self.api.request(
+            "GET",
+            "/api/clients",
+            token=self.token,
+            callback=self._on_clients_loaded,
+        )
+
+    def _on_clients_loaded(
+        self,
+        ok: bool,
+        status: int,
+        payload: dict | None,
+    ) -> None:
+        if not ok:
+            return
+        clients = (payload or {}).get("clients") or []
+        self.clients = {client["id"]: client for client in clients}
+        self.render_clients()
+
+    def render_clients(self) -> None:
+        clients = list(self.clients.values())
+        self.client_table.setRowCount(len(clients))
+        for row_index, client in enumerate(clients):
+            name = QTableWidgetItem(client.get("displayName") or "-")
+            client_id = QTableWidgetItem(client.get("id") or "-")
+            availability = QTableWidgetItem(
+                "空闲" if client.get("availability") == "idle" else "占用"
+            )
+            current_call = client.get("currentCall") or {}
+            call_text = QTableWidgetItem(current_call.get("id") or "-")
+            self.client_table.setItem(row_index, 0, name)
+            self.client_table.setItem(row_index, 1, client_id)
+            self.client_table.setItem(row_index, 2, availability)
+            self.client_table.setItem(row_index, 3, call_text)
+        idle_count = sum(
+            1 for client in clients if client.get("availability") == "idle"
+        )
+        self.client_hint.setText(
+            f"共 {len(clients)} 个客户端，{idle_count} 个空闲"
+        )
 
     def render_calls(self) -> None:
         calls = list(self.calls.values())
@@ -684,6 +996,24 @@ class AgentWindow(QMainWindow):
             else "当前没有等待或进行中的房间"
         )
 
+    def accept_assigned_call(self) -> None:
+        if self.claiming or self.current_call or not self.token or not self.agent:
+            return
+        assigned = find_assigned_call(
+            list(self.calls.values()),
+            self.agent["id"],
+        )
+        if not assigned:
+            return
+        self.claiming = True
+        self.render_calls()
+        self.api.request(
+            "POST",
+            f"/api/calls/{assigned['id']}/assignment",
+            token=self.token,
+            callback=self._on_assigned,
+        )
+
     def claim_call(self, call_id: str) -> None:
         if self.claiming or self.current_call or not self.token:
             return
@@ -708,6 +1038,26 @@ class AgentWindow(QMainWindow):
         if not call or not auth:
             QMessageBox.warning(self, "接听失败", "后端响应缺少通话或 RTC 凭证。")
             return
+        self._activate_agent_call(call, auth)
+
+    def _on_assigned(
+        self, ok: bool, status: int, payload: dict | None
+    ) -> None:
+        self.claiming = False
+        if not ok:
+            if status not in (403, 404, 409):
+                message = (payload or {}).get("detail", f"自动接单失败，HTTP {status}")
+                QMessageBox.warning(self, "自动接单失败", str(message))
+            self.refresh_calls()
+            return
+        call = (payload or {}).get("call")
+        auth = (payload or {}).get("rtc")
+        if not call or not auth:
+            self.refresh_calls()
+            return
+        self._activate_agent_call(call, auth)
+
+    def _activate_agent_call(self, call: dict, auth: dict) -> None:
         self.current_call = call
         self.current_status.setText("正在连接 RTC")
         self.current_session.setText(
@@ -763,9 +1113,15 @@ class AgentWindow(QMainWindow):
             self.muted = bool(event.get("muted"))
             self.mute_button.setText("取消静音" if self.muted else "静音")
         elif event_type == "error":
-            message = event.get("message") or event.get("code") or "RTC 异常"
+            code = str(event.get("code") or "").strip()
+            message = str(event.get("message") or "RTC 异常")
+            detail = (
+                f"{message}（错误码 {code}）"
+                if code and code not in message
+                else message
+            )
             self.current_status.setText("RTC 连接失败")
-            self.remote_state.setText(str(message))
+            self.remote_state.setText(detail)
         elif event_type == "stopped":
             self.mute_button.setEnabled(False)
             self.play_button.setEnabled(False)
@@ -883,6 +1239,308 @@ class AgentWindow(QMainWindow):
         calls = (payload or {}).get("calls") or []
         self.calls = {call["id"]: call for call in calls}
         self.render_calls()
+        self.accept_assigned_call()
+
+    def refresh_admin_data(self) -> None:
+        if not self.admin_token:
+            return
+        self.api.request(
+            "GET",
+            "/api/admin/clients",
+            token=self.admin_token,
+            callback=self._on_admin_clients,
+        )
+        self.api.request(
+            "GET",
+            "/api/admin/agents",
+            token=self.admin_token,
+            callback=self._on_admin_agents,
+        )
+        self.api.request(
+            "GET",
+            "/api/admin/audit",
+            token=self.admin_token,
+            callback=self._on_admin_audit,
+        )
+
+    def _on_admin_clients(
+        self,
+        ok: bool,
+        status: int,
+        payload: dict | None,
+    ) -> None:
+        if not ok:
+            self._show_admin_error("加载客户端失败", status, payload)
+            return
+        clients = (payload or {}).get("clients") or []
+        self.admin_clients_table.setRowCount(len(clients))
+        for row_index, client in enumerate(clients):
+            name = QTableWidgetItem(client.get("displayName") or "-")
+            name.setData(Qt.ItemDataRole.UserRole, client.get("id"))
+            client_id = QTableWidgetItem(client.get("id") or "-")
+            approval = QTableWidgetItem(
+                ADMIN_CLIENT_STATUS_LABELS.get(
+                    client.get("status"),
+                    client.get("status") or "-",
+                )
+            )
+            availability = QTableWidgetItem(
+                "空闲" if client.get("availability") == "idle" else "占用"
+            )
+            installation = QTableWidgetItem(client.get("installationUuid") or "-")
+            self.admin_clients_table.setItem(row_index, 0, name)
+            self.admin_clients_table.setItem(row_index, 1, client_id)
+            self.admin_clients_table.setItem(row_index, 2, approval)
+            self.admin_clients_table.setItem(row_index, 3, availability)
+            self.admin_clients_table.setItem(row_index, 4, installation)
+
+    def _on_admin_agents(
+        self,
+        ok: bool,
+        status: int,
+        payload: dict | None,
+    ) -> None:
+        if not ok:
+            self._show_admin_error("加载客服账号失败", status, payload)
+            return
+        agents = (payload or {}).get("agents") or []
+        self.admin_agents_table.setRowCount(len(agents))
+        for row_index, agent in enumerate(agents):
+            username = QTableWidgetItem(agent.get("username") or "-")
+            username.setData(Qt.ItemDataRole.UserRole, agent.get("id"))
+            display_name = QTableWidgetItem(agent.get("displayName") or "-")
+            enabled = QTableWidgetItem("启用" if agent.get("enabled") else "停用")
+            created = QTableWidgetItem(agent.get("createdAt") or "-")
+            self.admin_agents_table.setItem(row_index, 0, username)
+            self.admin_agents_table.setItem(row_index, 1, display_name)
+            self.admin_agents_table.setItem(row_index, 2, enabled)
+            self.admin_agents_table.setItem(row_index, 3, created)
+
+    def _on_admin_audit(
+        self,
+        ok: bool,
+        status: int,
+        payload: dict | None,
+    ) -> None:
+        if not ok:
+            self._show_admin_error("加载审计记录失败", status, payload)
+            return
+        events = (payload or {}).get("events") or []
+        self.admin_audit_table.setRowCount(len(events))
+        for row_index, event in enumerate(events):
+            values = (
+                event.get("createdAt") or "-",
+                event.get("action") or "-",
+                event.get("targetType") or "-",
+                event.get("targetId") or "-",
+                json.dumps(event.get("details") or {}, ensure_ascii=False),
+            )
+            for column, value in enumerate(values):
+                self.admin_audit_table.setItem(
+                    row_index,
+                    column,
+                    QTableWidgetItem(str(value)),
+                )
+
+    def _show_admin_error(
+        self,
+        title: str,
+        status: int,
+        payload: dict | None,
+    ) -> None:
+        message = (payload or {}).get("detail", f"HTTP {status}")
+        QMessageBox.warning(self, title, str(message))
+
+    def _admin_action(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict | None = None,
+    ) -> None:
+        if not self.admin_token:
+            return
+        self.api.request(
+            method,
+            path,
+            body=body,
+            token=self.admin_token,
+            callback=self._on_admin_action,
+        )
+
+    def _on_admin_action(
+        self,
+        ok: bool,
+        status: int,
+        payload: dict | None,
+    ) -> None:
+        if not ok:
+            self._show_admin_error("管理操作失败", status, payload)
+            return
+        self.refresh_admin_data()
+
+    def _selected_admin_id(self, table: QTableWidget) -> str | None:
+        row = table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "请选择记录", "请先选择一行。")
+            return None
+        item = table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def approve_selected_client(self) -> None:
+        client_id = self._selected_admin_id(self.admin_clients_table)
+        if client_id:
+            self._admin_action("POST", f"/api/admin/clients/{client_id}/approve")
+
+    def reject_selected_client(self) -> None:
+        client_id = self._selected_admin_id(self.admin_clients_table)
+        if not client_id:
+            return
+        reason, accepted = QInputDialog.getText(
+            self,
+            "拒绝客户端",
+            "拒绝原因（可留空）：",
+        )
+        if accepted:
+            self._admin_action(
+                "POST",
+                f"/api/admin/clients/{client_id}/reject",
+                body={"reason": reason.strip() or None},
+            )
+
+    def disable_selected_client(self) -> None:
+        client_id = self._selected_admin_id(self.admin_clients_table)
+        if client_id:
+            self._admin_action("POST", f"/api/admin/clients/{client_id}/disable")
+
+    def enable_selected_client(self) -> None:
+        client_id = self._selected_admin_id(self.admin_clients_table)
+        if client_id:
+            self._admin_action("POST", f"/api/admin/clients/{client_id}/enable")
+
+    def rename_selected_client(self) -> None:
+        client_id = self._selected_admin_id(self.admin_clients_table)
+        if not client_id:
+            return
+        row = self.admin_clients_table.currentRow()
+        current = self.admin_clients_table.item(row, 0).text()
+        name, accepted = QInputDialog.getText(
+            self,
+            "修改客户端名称",
+            "显示名称：",
+            text=current,
+        )
+        if accepted and name.strip():
+            self._admin_action(
+                "PATCH",
+                f"/api/admin/clients/{client_id}",
+                body={"display_name": name.strip()},
+            )
+
+    def reset_selected_client_credential(self) -> None:
+        client_id = self._selected_admin_id(self.admin_clients_table)
+        if not client_id:
+            return
+        answer = QMessageBox.question(
+            self,
+            "重置客户端凭证",
+            "重置后客户端需要重新提交注册并再次审批，继续吗？",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._admin_action(
+                "POST",
+                f"/api/admin/clients/{client_id}/reset-credential",
+            )
+
+    def create_agent_account(self) -> None:
+        username, accepted = QInputDialog.getText(
+            self,
+            "新建客服",
+            "登录用户名：",
+        )
+        if not accepted or not username.strip():
+            return
+        display_name, accepted = QInputDialog.getText(
+            self,
+            "新建客服",
+            "显示名称：",
+        )
+        if not accepted or not display_name.strip():
+            return
+        password, accepted = QInputDialog.getText(
+            self,
+            "新建客服",
+            "初始密码：",
+            QLineEdit.EchoMode.Password,
+        )
+        if not accepted or not password:
+            return
+        self._admin_action(
+            "POST",
+            "/api/admin/agents",
+            body={
+                "username": username.strip(),
+                "display_name": display_name.strip(),
+                "password": password,
+            },
+        )
+
+    def rename_selected_agent(self) -> None:
+        agent_id = self._selected_admin_id(self.admin_agents_table)
+        if not agent_id:
+            return
+        row = self.admin_agents_table.currentRow()
+        current = self.admin_agents_table.item(row, 1).text()
+        name, accepted = QInputDialog.getText(
+            self,
+            "修改客服显示名",
+            "显示名称：",
+            text=current,
+        )
+        if accepted and name.strip():
+            self._admin_action(
+                "PATCH",
+                f"/api/admin/agents/{agent_id}",
+                body={"display_name": name.strip()},
+            )
+
+    def reset_selected_agent_password(self) -> None:
+        agent_id = self._selected_admin_id(self.admin_agents_table)
+        if not agent_id:
+            return
+        password, accepted = QInputDialog.getText(
+            self,
+            "重置客服密码",
+            "新密码：",
+            QLineEdit.EchoMode.Password,
+        )
+        if accepted and password:
+            self._admin_action(
+                "POST",
+                f"/api/admin/agents/{agent_id}/reset-password",
+                body={"password": password},
+            )
+
+    def disable_selected_agent(self) -> None:
+        agent_id = self._selected_admin_id(self.admin_agents_table)
+        if agent_id:
+            self._admin_action("POST", f"/api/admin/agents/{agent_id}/disable")
+
+    def enable_selected_agent(self) -> None:
+        agent_id = self._selected_admin_id(self.admin_agents_table)
+        if agent_id:
+            self._admin_action("POST", f"/api/admin/agents/{agent_id}/enable")
+
+    def admin_logout(self) -> None:
+        if self.admin_token:
+            token = self.admin_token
+            self.admin_token = None
+            self.api.request(
+                "POST",
+                "/api/admin/logout",
+                token=token,
+            )
+        self.return_to_login()
 
     def logout(self) -> None:
         if self.current_call:
@@ -891,6 +1549,8 @@ class AgentWindow(QMainWindow):
         self.heartbeat_timer.stop()
         self.ws_ping_timer.stop()
         self.table_timer.stop()
+        self.client_timer.stop()
+        self.admin_timer.stop()
         if self.websocket:
             self.websocket.close()
             self.websocket = None
@@ -905,6 +1565,8 @@ class AgentWindow(QMainWindow):
         self.heartbeat_timer.stop()
         self.ws_ping_timer.stop()
         self.table_timer.stop()
+        self.client_timer.stop()
+        self.admin_timer.stop()
         if self.websocket:
             self.websocket.close()
             self.websocket = None
@@ -912,9 +1574,16 @@ class AgentWindow(QMainWindow):
         self.rtc_panel.hide()
         self.token = None
         self.agent = None
+        self.admin_token = None
+        self.admin = None
         self.calls.clear()
+        self.clients.clear()
         self.current_call = None
         self.table.setRowCount(0)
+        self.client_table.setRowCount(0)
+        self.admin_clients_table.setRowCount(0)
+        self.admin_agents_table.setRowCount(0)
+        self.admin_audit_table.setRowCount(0)
         self.login_page.password.clear()
         self.login_page.set_busy(False)
         self.stack.setCurrentWidget(self.login_page)
@@ -925,6 +1594,12 @@ class AgentWindow(QMainWindow):
             self.hangup_current()
         if self.websocket:
             self.websocket.close()
+        if self.admin_token:
+            self.api.request(
+                "POST",
+                "/api/admin/logout",
+                token=self.admin_token,
+            )
         self.rtc_panel.close()
         super().closeEvent(event)
 

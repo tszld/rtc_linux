@@ -1,6 +1,6 @@
 # Verified on 2026-10-19 with Python 3.10.22 on Windows x64.
 # Install exact versions with:
-# & "D:\ProgramFiles\Miniforge3\envs\rtc\python.exe" -m pip install -r requirements.lock.txt
+# python -m pip install -r requirements.lock.txt
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1

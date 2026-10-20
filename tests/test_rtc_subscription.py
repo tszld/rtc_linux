@@ -37,6 +37,12 @@ class RtcSubscriptionTests(unittest.TestCase):
     def test_caller_subscribes_to_mcu_audio(self) -> None:
         self.run_case("caller")
 
+    def test_caller_registers_and_waits_for_approval(self) -> None:
+        self.run_case("caller-registration")
+
+    def test_caller_recovers_from_invalid_device_credential(self) -> None:
+        self.run_case("caller-registration-recovery")
+
     def test_caller_publishes_and_stops_screen_track(self) -> None:
         self.run_case("caller-screen")
 
@@ -45,6 +51,9 @@ class RtcSubscriptionTests(unittest.TestCase):
 
     def test_agent_retries_screen_subscription_until_available(self) -> None:
         self.run_case("agent-screen-retry")
+
+    def test_agent_discovers_remote_screen_without_publish_event(self) -> None:
+        self.run_case("agent-screen-discovery")
 
     def test_caller_retries_audio_subscription_until_available(self) -> None:
         self.run_case("caller-audio-retry")

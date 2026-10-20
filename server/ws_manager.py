@@ -26,6 +26,7 @@ class ConnectionManager:
         self.agent_connections: dict[str, WebSocket] = {}
         self.caller_connections: dict[str, WebSocket] = {}
         self.lock = asyncio.Lock()
+        self.last_assigned_agent_id: str | None = None
 
     def create_ticket(self, kind: Literal["agent", "caller"], identity: str) -> str:
         ticket = secrets.token_urlsafe(32)
@@ -47,6 +48,19 @@ class ConnectionManager:
         self.tickets.pop(ticket, None)
         return value
 
+    def connected_agent_ids(self) -> list[str]:
+        agent_ids = sorted(self.agent_connections)
+        if self.last_assigned_agent_id not in agent_ids:
+            return agent_ids
+        index = agent_ids.index(self.last_assigned_agent_id)
+        return agent_ids[index + 1 :] + agent_ids[: index + 1]
+
+    def note_assignments(self, calls: list[dict]) -> None:
+        for call in calls:
+            agent_id = call.get("claimedAgentId")
+            if agent_id:
+                self.last_assigned_agent_id = agent_id
+
     async def register_agent(self, agent_id: str, websocket: WebSocket) -> None:
         async with self.lock:
             previous = self.agent_connections.get(agent_id)
@@ -56,7 +70,6 @@ class ConnectionManager:
                 await previous.close(code=4001, reason="replaced")
             except Exception:
                 pass
-        await self.send_agent_snapshot(agent_id)
 
     async def unregister_agent(self, agent_id: str, websocket: WebSocket) -> bool:
         async with self.lock:

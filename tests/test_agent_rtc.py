@@ -12,6 +12,7 @@ from PySide6.QtCore import QUrl
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import QApplication
 
+from agent.main import ROOT_DIR, find_assigned_call, resolve_agent_config_path
 from agent.rtc_panel import AudioWebEnginePage
 
 
@@ -41,6 +42,40 @@ class AudioWebEnginePagePermissionTests(unittest.TestCase):
         )
         self.assertEqual(decisions, [("MediaAudioCapture", True)])
         page.deleteLater()
+
+
+class AgentAssignmentTests(unittest.TestCase):
+    def test_relative_agent_config_path_is_resolved_from_project_root(self) -> None:
+        self.assertEqual(
+            resolve_agent_config_path("agent/config.json"),
+            (ROOT_DIR / "agent" / "config.json").resolve(),
+        )
+
+    def test_find_assigned_call_selects_only_unconnected_own_assignment(self) -> None:
+        calls = [
+            {
+                "id": "call-other",
+                "status": "connecting",
+                "claimedAgentId": "agent-other",
+                "connectedAt": None,
+            },
+            {
+                "id": "call-connected",
+                "status": "connecting",
+                "claimedAgentId": "agent-self",
+                "connectedAt": "2026-10-19T10:00:00+00:00",
+            },
+            {
+                "id": "call-assigned",
+                "status": "connecting",
+                "claimedAgentId": "agent-self",
+                "connectedAt": None,
+            },
+        ]
+
+        assigned = find_assigned_call(calls, "agent-self")
+
+        self.assertEqual(assigned["id"], "call-assigned")
 
 
 if __name__ == "__main__":

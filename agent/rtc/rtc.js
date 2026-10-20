@@ -19,6 +19,7 @@ let screenRetryTimer = null;
 let screenRetryUserId = null;
 let screenRetryDelayMs = 1000;
 let screenRetryErrorReported = false;
+let screenDiscoveryTimer = null;
 
 const MICROPHONE_TIMEOUT_MS = 20000;
 const RTC_JOIN_TIMEOUT_MS = 20000;
@@ -133,16 +134,33 @@ function scheduleScreenRetry(userId) {
     if (!client || stopRequested || screenRetryUserId !== userId) {
       return;
     }
-    const user = client.remoteUsers.find(
-      (item) => item.userId === userId && item.hasAuxiliary,
-    );
-    if (!user) {
-      $("screenState").textContent = "未共享";
-      screenRetryUserId = null;
-      return;
-    }
+    const user =
+      client.remoteUsers.find((item) => item.userId === userId) ||
+      { userId };
     await subscribeRemoteScreen(user);
   }, delay);
+}
+
+function startScreenDiscovery() {
+  if (screenDiscoveryTimer) {
+    clearInterval(screenDiscoveryTimer);
+  }
+  screenDiscoveryTimer = setInterval(() => {
+    if (!client || stopRequested) {
+      return;
+    }
+    const user = client.remoteUsers.find((item) => item.hasAuxiliary);
+    if (user) {
+      subscribeRemoteScreen(user);
+    }
+  }, 2000);
+}
+
+function stopScreenDiscovery() {
+  if (screenDiscoveryTimer) {
+    clearInterval(screenDiscoveryTimer);
+    screenDiscoveryTimer = null;
+  }
 }
 
 function stopRemoteScreen(userId) {
@@ -209,11 +227,18 @@ async function subscribeRemoteScreen(user) {
       } catch (_) {}
       return;
     }
+    try {
+      track.play($("remoteScreen"), { fit: "contain" });
+    } catch (error) {
+      try {
+        track.stop();
+      } catch (_) {}
+      throw error;
+    }
     remoteTracks.set(key, track);
     clearScreenRetry();
     track.on("track-ended", () => stopRemoteScreen(user.userId));
     $("screenState").textContent = "正在播放";
-    track.play("remoteScreen", { fit: "contain" });
     emit("remote_screen", { playing: true, userId: user.userId });
   })()
     .catch((error) => {
@@ -295,7 +320,7 @@ function buildClient() {
   client.on("user-published", (user, mediaType, auxiliary) => {
     if (mediaType === "audio") {
       subscribeRemoteAudio();
-    } else if (mediaType === "video" && auxiliary) {
+    } else if (mediaType === "video" && (auxiliary || user?.hasAuxiliary)) {
       subscribeRemoteScreen(user);
     }
   });
@@ -311,9 +336,11 @@ function buildClient() {
       stopRemoteScreen(user.userId);
     }
   });
+  startScreenDiscovery();
 }
 
 async function cleanup() {
+  stopScreenDiscovery();
   for (const track of remoteTracks.values()) {
     try {
       track.stop();
