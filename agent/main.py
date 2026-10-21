@@ -88,16 +88,15 @@ STATUS_LABELS = {
 }
 
 
-def find_assigned_call(calls: list[dict], agent_id: str) -> dict | None:
-    return next(
-        (
-            call
-            for call in calls
-            if call.get("status") == "connecting"
-            and call.get("claimedAgentId") == agent_id
-            and call.get("connectedAt") is None
+def find_next_waiting_call(calls: list[dict]) -> dict | None:
+    waiting_calls = (call for call in calls if call.get("status") == "waiting")
+    return min(
+        waiting_calls,
+        key=lambda call: (
+            call.get("readyAt") or call.get("createdAt") or "",
+            call.get("id") or "",
         ),
-        None,
+        default=None,
     )
 
 
@@ -188,7 +187,7 @@ class LoginPage(QWidget):
 
         title = QLabel("客服工作台")
         title.setObjectName("loginTitle")
-        subtitle = QLabel("登录后空闲客服会自动接收到系统派单")
+        subtitle = QLabel("登录后接收新呼叫提示并点击接听")
         subtitle.setObjectName("mutedText")
         subtitle.setWordWrap(True)
         card_layout.addWidget(title)
@@ -281,6 +280,9 @@ class AgentWindow(QMainWindow):
         self.claiming = False
         self.resuming_call_id: str | None = None
         self.muted = False
+        self.incoming_call_id: str | None = None
+        self.last_notified_waiting_call_id: str | None = None
+        self.screen_focus_active = False
 
         self.stack = QStackedWidget(self)
         self.setCentralWidget(self.stack)
@@ -347,7 +349,8 @@ class AgentWindow(QMainWindow):
 
         left = QFrame()
         left.setObjectName("sectionFrame")
-        left.setMinimumWidth(380)
+        left.setMinimumWidth(420)
+        self.dashboard_left = left
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(16, 15, 16, 16)
         left_layout.setSpacing(8)
@@ -370,16 +373,16 @@ class AgentWindow(QMainWindow):
         client_header.setStretchLastSection(False)
         client_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         client_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.client_table.setColumnWidth(1, 170)
-        self.client_table.setColumnWidth(2, 80)
-        self.client_table.setColumnWidth(3, 150)
+        self.client_table.setColumnWidth(1, 120)
+        self.client_table.setColumnWidth(2, 60)
+        self.client_table.setColumnWidth(3, 110)
         clients_layout.addWidget(self.client_hint)
         clients_layout.addWidget(self.client_table, 1)
 
         calls_page = QWidget()
         calls_layout = QVBoxLayout(calls_page)
         calls_layout.setContentsMargins(0, 8, 0, 0)
-        self.list_hint = QLabel("系统会按呼入顺序自动分配给空闲客服")
+        self.list_hint = QLabel("等待呼叫按呼入顺序排在前方，由客服点击接听")
         self.list_hint.setObjectName("mutedText")
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
@@ -396,10 +399,10 @@ class AgentWindow(QMainWindow):
         table_header.setStretchLastSection(False)
         table_header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
         table_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(1, 92)
-        self.table.setColumnWidth(2, 92)
-        self.table.setColumnWidth(3, 140)
-        self.table.setColumnWidth(4, 86)
+        self.table.setColumnWidth(1, 70)
+        self.table.setColumnWidth(2, 70)
+        self.table.setColumnWidth(3, 96)
+        self.table.setColumnWidth(4, 68)
         calls_layout.addWidget(self.list_hint)
         calls_layout.addWidget(self.table, 1)
         self.dashboard_tabs.addTab(clients_page, "客户端")
@@ -412,16 +415,39 @@ class AgentWindow(QMainWindow):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(12, 12, 12, 12)
         right_layout.setSpacing(6)
-        right_title = QLabel("当前通话")
-        right_title.setObjectName("sectionTitle")
+        right_title_row = QHBoxLayout()
+        right_title_row.setSpacing(8)
+        self.right_title = QLabel("当前通话")
+        self.right_title.setObjectName("sectionTitle")
+        self.screen_focus_button = QPushButton("放大共享画面")
+        self.screen_focus_button.setObjectName("compactButton")
+        self.screen_focus_button.setEnabled(False)
+        self.screen_focus_button.clicked.connect(self.toggle_screen_focus)
+        right_title_row.addWidget(self.right_title)
+        right_title_row.addStretch(1)
+        right_title_row.addWidget(self.screen_focus_button)
         self.current_status = QLabel("尚未接听")
         self.current_status.setObjectName("currentStatus")
-        self.current_session = QLabel("当前空闲，等待系统派单")
+        self.current_session = QLabel("当前空闲，等待新呼叫")
         self.current_session.setObjectName("mutedText")
         self.current_session.setWordWrap(True)
         self.remote_state = QLabel("")
         self.remote_state.setObjectName("remoteState")
         self.remote_state.setWordWrap(True)
+        self.incoming_panel = QFrame()
+        self.incoming_panel.setObjectName("incomingPanel")
+        incoming_layout = QHBoxLayout(self.incoming_panel)
+        incoming_layout.setContentsMargins(12, 10, 10, 10)
+        incoming_layout.setSpacing(10)
+        self.incoming_label = QLabel("")
+        self.incoming_label.setObjectName("incomingLabel")
+        self.incoming_label.setWordWrap(True)
+        self.accept_incoming_button = QPushButton("接听")
+        self.accept_incoming_button.setObjectName("incomingAcceptButton")
+        self.accept_incoming_button.clicked.connect(self.accept_incoming_call)
+        incoming_layout.addWidget(self.incoming_label, 1)
+        incoming_layout.addWidget(self.accept_incoming_button)
+        self.incoming_panel.hide()
         self.rtc_panel = RtcPanel()
         self.rtc_panel.setMinimumHeight(360)
         self.rtc_panel.hide()
@@ -441,10 +467,11 @@ class AgentWindow(QMainWindow):
         controls.addWidget(self.mute_button, 1)
         controls.addWidget(self.play_button, 2)
         controls.addWidget(self.hangup_button, 1)
-        right_layout.addWidget(right_title)
+        right_layout.addLayout(right_title_row)
         right_layout.addWidget(self.current_status)
         right_layout.addWidget(self.current_session)
         right_layout.addWidget(self.remote_state)
+        right_layout.addWidget(self.incoming_panel)
         right_layout.addWidget(self.rtc_panel, 1)
         right_layout.addLayout(controls)
 
@@ -452,9 +479,26 @@ class AgentWindow(QMainWindow):
         self.dashboard_splitter.addWidget(right)
         self.dashboard_splitter.setStretchFactor(0, 2)
         self.dashboard_splitter.setStretchFactor(1, 3)
-        self.dashboard_splitter.setSizes([430, 760])
+        self.dashboard_splitter.setSizes([500, 700])
         root.addWidget(self.dashboard_splitter, 1)
         return page
+
+    def toggle_screen_focus(self) -> None:
+        self.set_screen_focus(not self.screen_focus_active)
+
+    def set_screen_focus(self, focused: bool) -> None:
+        self.screen_focus_active = focused
+        self.dashboard_left.setVisible(not focused)
+        self.current_status.setVisible(not focused)
+        self.current_session.setVisible(not focused)
+        self.remote_state.setVisible(not focused)
+        self.incoming_panel.setVisible(False)
+        self.right_title.setText("共享画面" if focused else "当前通话")
+        self.screen_focus_button.setText(
+            "恢复布局" if focused else "放大共享画面"
+        )
+        if not focused:
+            self.dashboard_splitter.setSizes([500, 700])
 
     def _build_admin_dashboard(self) -> QWidget:
         page = QWidget()
@@ -715,6 +759,25 @@ class AgentWindow(QMainWindow):
             #remoteState {
                 color: #087f5b;
             }
+            #incomingPanel {
+                border: 1px solid #f0c36d;
+                border-radius: 6px;
+                background: #fff7e5;
+            }
+            #incomingLabel {
+                color: #8a4b00;
+                font-weight: 700;
+            }
+            #incomingAcceptButton {
+                border-color: #d97706;
+                background: #d97706;
+                color: white;
+            }
+            #compactButton {
+                min-height: 30px;
+                padding: 0 10px;
+                font-size: 12px;
+            }
             #connectionBadge {
                 min-width: 86px;
                 padding: 4px 10px;
@@ -912,11 +975,10 @@ class AgentWindow(QMainWindow):
                 self.mute_button.setEnabled(True)
                 self.play_button.setEnabled(True)
                 self.hangup_button.setEnabled(True)
+                self.screen_focus_button.setEnabled(True)
                 self.remote_state.setText("检测到中断会话，正在恢复 RTC")
                 self.update_current_call()
                 self.try_resume_current()
-            else:
-                self.accept_assigned_call()
         self.render_calls()
         self.refresh_clients()
 
@@ -995,24 +1057,37 @@ class AgentWindow(QMainWindow):
             if calls
             else "当前没有等待或进行中的房间"
         )
+        self.update_incoming_call(calls)
 
-    def accept_assigned_call(self) -> None:
-        if self.claiming or self.current_call or not self.token or not self.agent:
+    def update_incoming_call(self, calls: list[dict]) -> None:
+        call = find_next_waiting_call(calls)
+        if not call:
+            self.incoming_call_id = None
+            self.last_notified_waiting_call_id = None
+            self.incoming_panel.hide()
             return
-        assigned = find_assigned_call(
-            list(self.calls.values()),
-            self.agent["id"],
-        )
-        if not assigned:
+        if self.current_call or self.claiming:
+            self.incoming_call_id = None
+            self.incoming_panel.hide()
             return
-        self.claiming = True
-        self.render_calls()
-        self.api.request(
-            "POST",
-            f"/api/calls/{assigned['id']}/assignment",
-            token=self.token,
-            callback=self._on_assigned,
+
+        call_id = call["id"]
+        self.incoming_call_id = call_id
+        position = call.get("queuePosition")
+        queue_text = f" · 排队第 {position} 位" if position else ""
+        self.incoming_label.setText(
+            f"新呼叫：{call.get('callerName') or '未知客户'}{queue_text}"
         )
+        self.accept_incoming_button.setEnabled(not self.claiming)
+        self.incoming_panel.show()
+        if self.last_notified_waiting_call_id != call_id:
+            self.last_notified_waiting_call_id = call_id
+            QApplication.alert(self, 0)
+            QApplication.beep()
+
+    def accept_incoming_call(self) -> None:
+        if self.incoming_call_id:
+            self.claim_call(self.incoming_call_id)
 
     def claim_call(self, call_id: str) -> None:
         if self.claiming or self.current_call or not self.token:
@@ -1040,23 +1115,6 @@ class AgentWindow(QMainWindow):
             return
         self._activate_agent_call(call, auth)
 
-    def _on_assigned(
-        self, ok: bool, status: int, payload: dict | None
-    ) -> None:
-        self.claiming = False
-        if not ok:
-            if status not in (403, 404, 409):
-                message = (payload or {}).get("detail", f"自动接单失败，HTTP {status}")
-                QMessageBox.warning(self, "自动接单失败", str(message))
-            self.refresh_calls()
-            return
-        call = (payload or {}).get("call")
-        auth = (payload or {}).get("rtc")
-        if not call or not auth:
-            self.refresh_calls()
-            return
-        self._activate_agent_call(call, auth)
-
     def _activate_agent_call(self, call: dict, auth: dict) -> None:
         self.current_call = call
         self.current_status.setText("正在连接 RTC")
@@ -1068,6 +1126,7 @@ class AgentWindow(QMainWindow):
         self.mute_button.setEnabled(True)
         self.play_button.setEnabled(True)
         self.hangup_button.setEnabled(True)
+        self.screen_focus_button.setEnabled(True)
         self.rtc_panel.join(auth)
         self.render_calls()
 
@@ -1206,6 +1265,7 @@ class AgentWindow(QMainWindow):
         self.refresh_calls()
 
     def finish_current_local(self, message: str | None = None) -> None:
+        self.set_screen_focus(False)
         self.rtc_panel.leave()
         self.rtc_panel.hide()
         self.current_call = None
@@ -1217,6 +1277,7 @@ class AgentWindow(QMainWindow):
         self.mute_button.setEnabled(False)
         self.play_button.setEnabled(False)
         self.hangup_button.setEnabled(False)
+        self.screen_focus_button.setEnabled(False)
         if message:
             self.current_status.setText(message)
         self.render_calls()
@@ -1239,7 +1300,6 @@ class AgentWindow(QMainWindow):
         calls = (payload or {}).get("calls") or []
         self.calls = {call["id"]: call for call in calls}
         self.render_calls()
-        self.accept_assigned_call()
 
     def refresh_admin_data(self) -> None:
         if not self.admin_token:
@@ -1579,6 +1639,12 @@ class AgentWindow(QMainWindow):
         self.calls.clear()
         self.clients.clear()
         self.current_call = None
+        self.incoming_call_id = None
+        self.last_notified_waiting_call_id = None
+        self.set_screen_focus(False)
+        self.incoming_panel.hide()
+        self.screen_focus_button.setEnabled(False)
+        self.screen_focus_button.setText("放大共享画面")
         self.table.setRowCount(0)
         self.client_table.setRowCount(0)
         self.admin_clients_table.setRowCount(0)

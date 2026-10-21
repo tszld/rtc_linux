@@ -31,11 +31,41 @@ $env:RTC_PYTHON = ".\runtime\python.exe"
 `setup.ps1` 优先使用 `RTC_PYTHON`，否则使用 PATH 中的 `python` 或 Windows
 `py -3.10`。相对路径以项目根目录为基准。不会创建或启用已弃用的 `.venv`。
 
-当前验证过的精确依赖版本记录在 `requirements.lock.txt`。需要复现同一环境时运行：
+依赖清单按运行形态拆分：
+
+| 文件 | 用途 |
+|---|---|
+| `requirements.txt` | Windows 全量开发环境 |
+| `requirements-server.txt` | 只运行 FastAPI 控制端，适合 Linux 云服务器 |
+| `requirements-caller.txt` | 呼叫端无 pip 依赖，仅作明确说明 |
+| `requirements-agent.txt` | PySide6 Windows 客服端 |
+
+安装完整环境或指定组件：
+
+```powershell
+.\setup.ps1
+.\setup.ps1 -Component server
+.\setup.ps1 -Component caller
+.\setup.ps1 -Component agent
+```
+
+Linux 云服务器只安装服务端依赖：
+
+```bash
+python3.10 -m pip install -r requirements-server.txt
+python -X utf8 main.py server
+```
+
+呼叫端启动器只使用 Python 标准库；DingRTC 通过静态 `web/sdk.js` 加载，不需要
+pip 包。JavaScript 自动化测试需要 Node.js，但 Node.js 不是三种运行端的运行依赖。
+
+当前验证过的精确 Windows 全量依赖记录在 `requirements.lock.txt`。需要复现同一环境时运行：
 
 ```powershell
 python -m pip install -r .\requirements.lock.txt
 ```
+
+该锁文件包含 PySide6，只适用于当前 Windows 开发环境，不能直接作为 Linux 服务端锁文件。
 
 在已初始化 Conda 的 PowerShell 中激活统一环境：
 
@@ -193,10 +223,10 @@ python -X utf8 main.py caller
 1. 超级管理员登录管理界面，批准待审批客户端。
 2. 电脑 B 启动两个客服实例，分别登录两个客服账号。
 3. 两个客服端应在客户端目录看到同一批已批准客户端及空闲/占用状态。
-4. 电脑 A 点击“发起呼叫”；若至少一个客服在线且空闲，系统应自动把会话派给
-   空闲客服，客服端自动接入 RTC，呼叫端显示“客服连接中”。
+4. 电脑 A 点击“发起呼叫”；空闲客服端应出现新呼叫提示、提示音和“接听”按钮，
+   呼叫端在客服点击接听前保持“排队中”。
 5. 两个客服都在通话时，再发起呼叫，呼叫端应显示“排队中”和当前排队位置。
-6. 任一客服挂断后，队列首位呼叫应自动派给释放出来的客服。
+6. 任一客服挂断后，队列首位呼叫应提示空闲客服，由客服点击“接听”后进入 RTC。
 7. 双方检查默认麦克风和扬声器能否双向听到声音。
 8. 呼叫端点击“共享屏幕”，客服端应看到呼叫端选择的屏幕画面。
 9. 任意一方主动挂断后，呼叫页面和客服端都应结束当前通话并退出 RTC。
@@ -212,7 +242,7 @@ python -m unittest discover -s tests -v
 
 当前自动化结果：
 
-- 完整自动化测试 `51/51` 通过。
+- 完整自动化测试 `50/50` 通过。
 - Python 代码通过 `compileall` 语法检查。
 - 呼叫端和客服端 JavaScript 通过 `node --check` 语法检查。
 - 真实桌面麦克风权限、真实 DingRTC 入会和双向音频尚未在当前环境验收。

@@ -12,7 +12,7 @@ from PySide6.QtCore import QUrl
 from PySide6.QtWebEngineCore import QWebEnginePage
 from PySide6.QtWidgets import QApplication
 
-from agent.main import ROOT_DIR, find_assigned_call, resolve_agent_config_path
+from agent.main import ROOT_DIR, find_next_waiting_call, resolve_agent_config_path
 from agent.rtc_panel import AudioWebEnginePage
 
 
@@ -51,32 +51,27 @@ class AgentAssignmentTests(unittest.TestCase):
             (ROOT_DIR / "agent" / "config.json").resolve(),
         )
 
-    def test_find_assigned_call_selects_only_unconnected_own_assignment(self) -> None:
+    def test_next_waiting_call_uses_ready_time_fifo(self) -> None:
         calls = [
             {
-                "id": "call-other",
-                "status": "connecting",
-                "claimedAgentId": "agent-other",
-                "connectedAt": None,
+                "id": "call-newer",
+                "status": "waiting",
+                "readyAt": "2026-10-20T10:00:02+00:00",
             },
             {
-                "id": "call-connected",
-                "status": "connecting",
-                "claimedAgentId": "agent-self",
-                "connectedAt": "2026-10-19T10:00:00+00:00",
+                "id": "call-active",
+                "status": "active",
             },
             {
-                "id": "call-assigned",
-                "status": "connecting",
-                "claimedAgentId": "agent-self",
-                "connectedAt": None,
+                "id": "call-older",
+                "status": "waiting",
+                "readyAt": "2026-10-20T10:00:01+00:00",
             },
         ]
 
-        assigned = find_assigned_call(calls, "agent-self")
+        waiting = find_next_waiting_call(calls)
 
-        self.assertEqual(assigned["id"], "call-assigned")
-
+        self.assertEqual(waiting["id"], "call-older")
 
 if __name__ == "__main__":
     unittest.main()

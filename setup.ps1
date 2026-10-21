@@ -1,3 +1,8 @@
+param(
+    [ValidateSet("all", "server", "agent", "caller")]
+    [string]$Component = "all"
+)
+
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
@@ -24,6 +29,17 @@ if (-not [string]::IsNullOrWhiteSpace($Python)) {
     }
 }
 
+$RequirementsFile = switch ($Component) {
+    "server" { "requirements-server.txt" }
+    "agent" { "requirements-agent.txt" }
+    "caller" { "requirements-caller.txt" }
+    default { "requirements.txt" }
+}
+
 Write-Host "Using Python: $Python"
-& $Python @PythonArguments -m pip install -r requirements.txt
-Write-Host "Setup complete."
+Write-Host "Installing component: $Component"
+& $Python @PythonArguments -m pip install -r $RequirementsFile
+if ($LASTEXITCODE -ne 0) {
+    throw "Dependency installation failed: $RequirementsFile"
+}
+Write-Host "Setup complete: $Component"

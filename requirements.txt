@@ -1,4 +1,5 @@
-fastapi>=0.115,<1
-uvicorn[standard]>=0.30,<1
-PySide6>=6.7,<7
-
+# Complete Windows development environment for all three runtime components.
+# The caller has no pip dependencies, but its file is included for consistency.
+-r requirements-server.txt
+-r requirements-agent.txt
+-r requirements-caller.txt

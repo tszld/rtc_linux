@@ -1,4 +1,6 @@
-# Verified on 2026-10-19 with Python 3.10.22 on Windows x64.
+# Originally verified as the complete Windows x64 development environment
+# on 2026-10-19 with Python 3.10.22.
+# This lock includes PySide6 and must not be used as the Linux server lock file.
 # Install exact versions with:
 # python -m pip install -r requirements.lock.txt
 annotated-doc==0.0.5

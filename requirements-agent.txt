@@ -1,0 +1,3 @@
+# PySide6 desktop customer-service client dependencies.
+# The agent runs on a Windows desktop with a microphone, speaker, and QtWebEngine.
+PySide6>=6.7,<7

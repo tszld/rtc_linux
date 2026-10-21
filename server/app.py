@@ -43,14 +43,12 @@ from .admin import (
 from .calls import (
     CallError,
     agent_hangup as agent_hangup_action,
-    assign_waiting_calls,
     claim_call,
     create_call,
     create_call_for_client,
     end_call_by_caller,
     expire_calls,
     get_call,
-    get_assigned_call,
     list_visible_calls,
     mark_agent_connected,
     mark_agent_disconnected,
@@ -90,12 +88,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
     settings = config or load_config()
     manager = ConnectionManager(settings)
 
-    async def dispatch_and_broadcast_calls() -> None:
-        assigned = assign_waiting_calls(
-            settings,
-            manager.connected_agent_ids(),
-        )
-        manager.note_assignments(assigned)
+    async def broadcast_calls() -> None:
         await manager.broadcast_calls()
 
     async def expiry_loop() -> None:
@@ -104,9 +97,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             try:
                 changed = expire_calls(settings)
                 if changed:
-                    # 先让客服端看到超时后的 waiting/ended 状态，再开始下一轮派单。
                     await manager.broadcast_calls()
-                    await dispatch_and_broadcast_calls()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -315,7 +306,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         x_caller_token: Annotated[str | None, Header()] = None,
     ) -> dict:
         mark_caller_ready(settings, call_id, x_caller_token or "")
-        await dispatch_and_broadcast_calls()
+        await broadcast_calls()
         return {"call": get_call(settings, call_id)}
 
     @app.post("/api/calls/{call_id}/ws-ticket")
@@ -340,36 +331,31 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         x_caller_token: Annotated[str | None, Header()] = None,
     ) -> dict:
         call = end_call_by_caller(settings, call_id, x_caller_token or "")
-        await dispatch_and_broadcast_calls()
+        await broadcast_calls()
         return {"call": call}
 
     @app.post("/api/calls/{call_id}/claim")
     async def agent_claim(call_id: str, agent: Agent) -> dict:
         call, rtc_auth = claim_call(settings, call_id, agent)
-        await dispatch_and_broadcast_calls()
-        return {"call": call, "rtc": rtc_auth}
-
-    @app.post("/api/calls/{call_id}/assignment")
-    def agent_assignment(call_id: str, agent: Agent) -> dict:
-        call, rtc_auth = get_assigned_call(settings, call_id, agent)
+        await broadcast_calls()
         return {"call": call, "rtc": rtc_auth}
 
     @app.post("/api/calls/{call_id}/connected")
     async def agent_connected(call_id: str, agent: Agent) -> dict:
         call = mark_agent_connected(settings, call_id, agent)
-        await dispatch_and_broadcast_calls()
+        await broadcast_calls()
         return {"call": call}
 
     @app.post("/api/calls/{call_id}/hangup")
     async def agent_hangup_endpoint(call_id: str, agent: Agent) -> dict:
         call = agent_hangup_action(settings, call_id, agent)
-        await dispatch_and_broadcast_calls()
+        await broadcast_calls()
         return {"call": call}
 
     @app.post("/api/calls/{call_id}/resume")
     async def agent_resume(call_id: str, agent: Agent) -> dict:
         call, rtc_auth = resume_agent_call(settings, call_id, agent)
-        await dispatch_and_broadcast_calls()
+        await broadcast_calls()
         return {"call": call, "rtc": rtc_auth}
 
     @app.post("/api/calls/{call_id}/force-end")
@@ -383,7 +369,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         ):
             raise CallError("当前客服无权结束该会话", 403)
         ended = end_call(settings, call_id, "agent_force_end", "agent", agent.id)
-        await dispatch_and_broadcast_calls()
+        await broadcast_calls()
         return {"call": ended}
 
     @app.get("/api/admin/clients")
@@ -521,7 +507,7 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         if consumed:
             agent_id = consumed.identity
             await manager.register_agent(agent_id, websocket)
-            await dispatch_and_broadcast_calls()
+            await broadcast_calls()
             try:
                 while True:
                     message = await websocket.receive_text()
@@ -530,11 +516,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
             except WebSocketDisconnect:
                 removed = await manager.unregister_agent(agent_id, websocket)
                 if removed and mark_agent_disconnected(settings, agent_id):
-                    await dispatch_and_broadcast_calls()
+                    await broadcast_calls()
             except Exception:
                 removed = await manager.unregister_agent(agent_id, websocket)
                 if removed and mark_agent_disconnected(settings, agent_id):
-                    await dispatch_and_broadcast_calls()
+                    await broadcast_calls()
             return
 
         assert caller_ticket is not None
@@ -548,11 +534,11 @@ def create_app(config: ServerConfig | None = None) -> FastAPI:
         except WebSocketDisconnect:
             removed = await manager.unregister_caller(call_id, websocket)
             if removed and mark_caller_disconnected(settings, call_id):
-                await dispatch_and_broadcast_calls()
+                await broadcast_calls()
         except Exception:
             removed = await manager.unregister_caller(call_id, websocket)
             if removed and mark_caller_disconnected(settings, call_id):
-                await dispatch_and_broadcast_calls()
+                await broadcast_calls()
 
     return app
 

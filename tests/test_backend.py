@@ -38,13 +38,11 @@ from server.auth import (
 from server.calls import (
     CallError,
     agent_hangup,
-    assign_waiting_calls,
     claim_call,
     create_call,
     create_call_for_client,
     expire_calls,
     get_call,
-    get_assigned_call,
     mark_agent_connected,
     mark_agent_disconnected,
     mark_caller_disconnected,
@@ -456,58 +454,36 @@ class BackendServiceTests(unittest.TestCase):
             claim_call(self.config, second["id"], agent)
         self.assertEqual(context.exception.status_code, 409)
 
-    def test_auto_assignment_is_fifo_and_reuses_freed_agent(self) -> None:
+    def test_waiting_calls_keep_fifo_and_require_manual_claim(self) -> None:
         _, agent_one, _ = login_agent(self.config, "agent01", "agent123")
         _, agent_two, _ = login_agent(self.config, "agent02", "agent123")
-        first, _ = create_ready_call(self.config, "caller-auto-first")
-        second, _ = create_ready_call(self.config, "caller-auto-second")
-        third, _ = create_ready_call(self.config, "caller-auto-third")
+        first, _ = create_ready_call(self.config, "caller-queue-first")
+        second, _ = create_ready_call(self.config, "caller-queue-second")
+        third, _ = create_ready_call(self.config, "caller-queue-third")
 
         self.assertEqual(get_call(self.config, first["id"])["queuePosition"], 1)
         self.assertEqual(get_call(self.config, second["id"])["queuePosition"], 2)
         self.assertEqual(get_call(self.config, third["id"])["queuePosition"], 3)
         self.assertEqual(get_call(self.config, third["id"])["queueSize"], 3)
 
-        assigned = assign_waiting_calls(
-            self.config,
-            [agent_two.id, agent_one.id],
-        )
-        self.assertEqual(
-            [call["id"] for call in assigned],
-            [first["id"], second["id"]],
-        )
-        self.assertEqual(assigned[0]["claimedAgentId"], agent_two.id)
-        self.assertEqual(assigned[1]["claimedAgentId"], agent_one.id)
+        first_claimed, _ = claim_call(self.config, first["id"], agent_two)
+        second_claimed, _ = claim_call(self.config, second["id"], agent_one)
+        self.assertEqual(first_claimed["claimedAgentId"], agent_two.id)
+        self.assertEqual(second_claimed["claimedAgentId"], agent_one.id)
 
         third_waiting = get_call(self.config, third["id"])
         self.assertEqual(third_waiting["status"], "waiting")
         self.assertEqual(third_waiting["queuePosition"], 1)
         self.assertEqual(third_waiting["queueSize"], 1)
-        self.assertEqual(
-            assign_waiting_calls(
-                self.config,
-                [agent_one.id, agent_two.id],
-            ),
-            [],
-        )
-
-        assigned_call, rtc_auth = get_assigned_call(
-            self.config,
-            first["id"],
-            agent_two,
-        )
-        self.assertEqual(assigned_call["claimedAgentId"], agent_two.id)
-        self.assertEqual(rtc_auth["channel"], first["roomId"])
-        with self.assertRaises(CallError):
-            get_assigned_call(self.config, first["id"], agent_one)
 
         agent_hangup(self.config, first["id"], agent_two)
-        reused = assign_waiting_calls(
-            self.config,
-            [agent_one.id, agent_two.id],
-        )
-        self.assertEqual([call["id"] for call in reused], [third["id"]])
-        self.assertEqual(reused[0]["claimedAgentId"], agent_two.id)
+        third_still_waiting = get_call(self.config, third["id"])
+        self.assertEqual(third_still_waiting["status"], "waiting")
+        self.assertIsNone(third_still_waiting["claimedAgentId"])
+
+        third_claimed, _ = claim_call(self.config, third["id"], agent_two)
+        self.assertEqual(third_claimed["status"], "connecting")
+        self.assertEqual(third_claimed["claimedAgentId"], agent_two.id)
 
     def test_logout_allows_relogin(self) -> None:
         first_token, first_agent, _ = login_agent(
@@ -572,29 +548,6 @@ class BackendServiceTests(unittest.TestCase):
         self.assertIsNotNone(consumed)
         self.assertEqual(consumed.identity, "agent-test")
         self.assertIsNone(manager.consume_ticket(ticket, "agent"))
-
-    def test_agent_dispatch_order_rotates_after_last_assignment(self) -> None:
-        manager = ConnectionManager(self.config)
-        manager.agent_connections = {
-            "agent-a": object(),
-            "agent-b": object(),
-        }
-        self.assertEqual(
-            manager.connected_agent_ids(),
-            ["agent-a", "agent-b"],
-        )
-
-        manager.note_assignments([{"claimedAgentId": "agent-a"}])
-        self.assertEqual(
-            manager.connected_agent_ids(),
-            ["agent-b", "agent-a"],
-        )
-
-        manager.note_assignments([{"claimedAgentId": "agent-b"}])
-        self.assertEqual(
-            manager.connected_agent_ids(),
-            ["agent-a", "agent-b"],
-        )
 
     def test_database_does_not_store_app_key_or_plaintext_password(self) -> None:
         with db_session(self.config) as connection:
@@ -801,25 +754,29 @@ class HttpContractTests(unittest.TestCase):
         self.assertEqual(status, 200, caller_view)
         self.assertEqual(caller_view["call"]["status"], "ended")
 
-    def test_ready_auto_assigns_connected_agent_and_queues_next_call(self) -> None:
+    def test_connected_agent_receives_waiting_call_and_must_claim_it(self) -> None:
         admin_token = self.admin_login()
         agent_token = self.login("agent18")
-        wrong_agent_token = self.login("agent19")
-        first, _ = self.create_authenticated_call(
-            "caller-auto-ws-first",
-            admin_token=admin_token,
-        )
-        first_id = first["call"]["id"]
-        first_token = first["callerToken"]
-        status, waiting = request_json(
-            self.base_url,
-            "POST",
-            f"/api/calls/{first_id}/ready",
-            headers={"X-Caller-Token": first_token},
-        )
-        self.assertEqual(status, 200, waiting)
-        self.assertEqual(waiting["call"]["status"], "waiting")
-        self.assertEqual(waiting["call"]["queuePosition"], 1)
+        created_calls = []
+        for suffix in ("first", "second"):
+            created, _ = self.create_authenticated_call(
+                f"caller-manual-ws-{suffix}",
+                admin_token=admin_token,
+            )
+            call_id = created["call"]["id"]
+            caller_token = created["callerToken"]
+            status, waiting = request_json(
+                self.base_url,
+                "POST",
+                f"/api/calls/{call_id}/ready",
+                headers={"X-Caller-Token": caller_token},
+            )
+            self.assertEqual(status, 200, waiting)
+            self.assertEqual(waiting["call"]["status"], "waiting")
+            created_calls.append((call_id, caller_token))
+
+        first_id, first_token = created_calls[0]
+        second_id, second_token = created_calls[1]
 
         status, ticket_payload = request_json(
             self.base_url,
@@ -837,48 +794,31 @@ class HttpContractTests(unittest.TestCase):
         with websocket_connect(ws_url, open_timeout=3) as websocket:
             snapshot = json.loads(websocket.recv(timeout=3))
             self.assertEqual(snapshot["type"], "snapshot")
-            assigned_snapshot = next(
+            waiting_snapshot = next(
                 call for call in snapshot["calls"] if call["id"] == first_id
             )
-            self.assertEqual(assigned_snapshot["status"], "connecting")
-            claimed_agent_id = assigned_snapshot["claimedAgentId"]
-            self.assertIsNotNone(claimed_agent_id)
+            self.assertEqual(waiting_snapshot["status"], "waiting")
+            self.assertIsNone(waiting_snapshot["claimedAgentId"])
 
-            status, assigned = request_json(
+            status, claimed = request_json(
                 self.base_url,
                 "POST",
-                f"/api/calls/{first_id}/assignment",
+                f"/api/calls/{first_id}/claim",
                 token=agent_token,
             )
-            self.assertEqual(status, 200, assigned)
-            self.assertEqual(assigned["call"]["claimedAgentId"], claimed_agent_id)
-            self.assertEqual(assigned["call"]["status"], "connecting")
-            self.assertNotIn("test-app-key", json.dumps(assigned))
+            self.assertEqual(status, 200, claimed)
+            self.assertEqual(claimed["call"]["status"], "connecting")
+            self.assertNotIn("test-app-key", json.dumps(claimed))
 
-            status, forbidden = request_json(
+            status, second_view = request_json(
                 self.base_url,
-                "POST",
-                f"/api/calls/{first_id}/assignment",
-                token=wrong_agent_token,
-            )
-            self.assertEqual(status, 403, forbidden)
-
-            second, _ = self.create_authenticated_call(
-                "caller-auto-ws-second",
-                admin_token=admin_token,
-            )
-            second_id = second["call"]["id"]
-            second_token = second["callerToken"]
-            status, second_ready = request_json(
-                self.base_url,
-                "POST",
-                f"/api/calls/{second_id}/ready",
+                "GET",
+                f"/api/calls/{second_id}",
                 headers={"X-Caller-Token": second_token},
             )
-            self.assertEqual(status, 200, second_ready)
-            self.assertEqual(second_ready["call"]["status"], "waiting")
-            self.assertEqual(second_ready["call"]["queuePosition"], 1)
-            self.assertEqual(second_ready["call"]["queueSize"], 1)
+            self.assertEqual(status, 200, second_view)
+            self.assertEqual(second_view["call"]["status"], "waiting")
+            self.assertEqual(second_view["call"]["queuePosition"], 1)
 
             status, hung_up = request_json(
                 self.base_url,
@@ -894,11 +834,17 @@ class HttpContractTests(unittest.TestCase):
                 headers={"X-Caller-Token": second_token},
             )
             self.assertEqual(status, 200, second_view)
-            self.assertEqual(second_view["call"]["status"], "connecting")
-            self.assertEqual(
-                second_view["call"]["claimedAgentId"],
-                claimed_agent_id,
+            self.assertEqual(second_view["call"]["status"], "waiting")
+            self.assertIsNone(second_view["call"]["claimedAgentId"])
+
+            status, second_claimed = request_json(
+                self.base_url,
+                "POST",
+                f"/api/calls/{second_id}/claim",
+                token=agent_token,
             )
+            self.assertEqual(status, 200, second_claimed)
+            self.assertEqual(second_claimed["call"]["status"], "connecting")
 
     def test_private_network_cors_preflight_is_allowed(self) -> None:
         origin = "http://127.0.0.1:51947"

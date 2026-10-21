@@ -43,6 +43,11 @@ $env:RTC_PYTHON = ".\runtime\python.exe"
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
+依赖按组件拆分：`requirements-server.txt` 用于 Linux/FastAPI 控制端，
+`requirements-agent.txt` 用于 Windows/PySide6 客服端，`requirements-caller.txt`
+仅说明呼叫端无 pip 依赖；`requirements.txt` 是 Windows 全量开发环境。
+`setup.ps1` 可通过 `-Component all|server|agent|caller` 选择组件。
+
 标准自动化测试：
 
 ```powershell
@@ -168,7 +173,7 @@ connecting/active -> interrupted -> connecting/active/waiting/ended
 
 - `T0`：已完成，源码已迁移到 `D:\Projects\rtc`。
 - `T1`：已完成。后端事务、并发接听、超时、WebSocket 票据、断线恢复和重启收尾
-  已加固；当前完整自动化测试达到 `51/51` 通过。
+  已加固；当前完整自动化测试达到 `50/50` 通过。
 - `T2`：自动化和模拟验证已完成主要部分，包括 WebChannel 事件桥接、双客服同步、
   同账号重复登录拒绝、入会中挂断清理和重启恢复；真实桌面麦克风权限、真实
   DingRTC 入会和真实音频尚未验收。
