@@ -1,9 +1,11 @@
 .venv/
 __pycache__/
 *.pyc
+.codex-test-temp/
+.tmp-render/
+.tmp-tests*/
 server/data/
-server/config.local.json
-agent/config.local.json
-caller/config.local.json
+config.json
 *.log
-
+*.token
+robot/vendor/

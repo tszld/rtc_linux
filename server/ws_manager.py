@@ -1,120 +1,122 @@
 from __future__ import annotations
 
 import asyncio
-import secrets
-import time
-from dataclasses import dataclass
-from typing import Literal
+from collections.abc import Iterable
+from typing import Any
 
 from fastapi import WebSocket
 
-from .calls import get_call, list_visible_calls
-from .config import ServerConfig
+from .auth import Principal
 
 
-@dataclass
-class WsTicket:
-    kind: Literal["agent", "caller"]
-    identity: str
-    expires_at: float
+class WebSocketManager:
+    def __init__(self) -> None:
+        self._agents: dict[str, set[WebSocket]] = {}
+        self._robots: dict[str, set[WebSocket]] = {}
+        self._lock = asyncio.Lock()
 
+    async def connect(
+        self,
+        websocket: WebSocket,
+        principal: Principal,
+    ) -> None:
+        await websocket.accept()
+        async with self._lock:
+            target = (
+                self._agents
+                if principal.principal_type == "agent"
+                else self._robots
+            )
+            target.setdefault(principal.id, set()).add(websocket)
 
-class ConnectionManager:
-    def __init__(self, config: ServerConfig):
-        self.config = config
-        self.tickets: dict[str, WsTicket] = {}
-        self.agent_connections: dict[str, WebSocket] = {}
-        self.caller_connections: dict[str, WebSocket] = {}
-        self.lock = asyncio.Lock()
+    async def disconnect(
+        self,
+        websocket: WebSocket,
+        principal: Principal,
+    ) -> bool:
+        async with self._lock:
+            target = (
+                self._agents
+                if principal.principal_type == "agent"
+                else self._robots
+            )
+            connections = target.get(principal.id)
+            if connections is not None:
+                connections.discard(websocket)
+                if not connections:
+                    target.pop(principal.id, None)
+                    return False
+            return True
 
-    def create_ticket(self, kind: Literal["agent", "caller"], identity: str) -> str:
-        ticket = secrets.token_urlsafe(32)
-        self.tickets[ticket] = WsTicket(
-            kind=kind,
-            identity=identity,
-            expires_at=time.monotonic() + self.config.ws_ticket_ttl_seconds,
-        )
-        return ticket
+    async def connected_agent_ids(self) -> list[str]:
+        async with self._lock:
+            return list(self._agents)
 
-    def consume_ticket(
-        self, ticket: str, expected_kind: Literal["agent", "caller"]
-    ) -> WsTicket | None:
-        value = self.tickets.get(ticket)
-        if not value:
-            return None
-        if value.kind != expected_kind or value.expires_at <= time.monotonic():
-            return None
-        self.tickets.pop(ticket, None)
-        return value
+    async def send_to_agent(
+        self,
+        agent_id: str,
+        message: dict[str, Any],
+    ) -> None:
+        async with self._lock:
+            connections = list(self._agents.get(agent_id, ()))
+        await self._send_many(self._agents, agent_id, connections, message)
 
-    async def register_agent(self, agent_id: str, websocket: WebSocket) -> None:
-        async with self.lock:
-            previous = self.agent_connections.get(agent_id)
-            self.agent_connections[agent_id] = websocket
-        if previous and previous is not websocket:
+    async def send_to_robot(
+        self,
+        robot_id: str,
+        message: dict[str, Any],
+    ) -> None:
+        async with self._lock:
+            connections = list(self._robots.get(robot_id, ()))
+        await self._send_many(self._robots, robot_id, connections, message)
+
+    async def broadcast_to_agents(
+        self,
+        agent_ids: Iterable[str],
+        message: dict[str, Any],
+    ) -> None:
+        for agent_id in dict.fromkeys(agent_ids):
+            await self.send_to_agent(agent_id, message)
+
+    async def close_principal(
+        self,
+        *,
+        principal_type: str,
+        principal_id: str,
+        code: int = 4403,
+        reason: str = "disabled",
+    ) -> None:
+        async with self._lock:
+            registry = (
+                self._agents
+                if principal_type == "agent"
+                else self._robots
+            )
+            connections = list(registry.get(principal_id, ()))
+        for websocket in connections:
             try:
-                await previous.close(code=4001, reason="replaced")
+                await websocket.close(code=code, reason=reason)
             except Exception:
                 pass
 
-    async def unregister_agent(self, agent_id: str, websocket: WebSocket) -> bool:
-        async with self.lock:
-            if self.agent_connections.get(agent_id) is websocket:
-                self.agent_connections.pop(agent_id, None)
-                return True
-        return False
-
-    async def register_caller(self, call_id: str, websocket: WebSocket) -> None:
-        async with self.lock:
-            previous = self.caller_connections.get(call_id)
-            self.caller_connections[call_id] = websocket
-        if previous and previous is not websocket:
+    async def _send_many(
+        self,
+        registry: dict[str, set[WebSocket]],
+        principal_id: str,
+        connections: list[WebSocket],
+        message: dict[str, Any],
+    ) -> None:
+        dead = []
+        for websocket in connections:
             try:
-                await previous.close(code=4001, reason="replaced")
+                await websocket.send_json(message)
             except Exception:
-                pass
-        await self.send_caller_call(call_id)
-
-    async def unregister_caller(self, call_id: str, websocket: WebSocket) -> bool:
-        async with self.lock:
-            if self.caller_connections.get(call_id) is websocket:
-                self.caller_connections.pop(call_id, None)
-                return True
-        return False
-
-    async def send_agent_snapshot(self, agent_id: str) -> None:
-        websocket = self.agent_connections.get(agent_id)
-        if not websocket:
-            return
-        payload = {
-            "type": "snapshot",
-            "calls": list_visible_calls(self.config),
-        }
-        await self._safe_send(websocket, payload)
-
-    async def send_caller_call(self, call_id: str) -> None:
-        websocket = self.caller_connections.get(call_id)
-        if not websocket:
-            return
-        try:
-            call = get_call(self.config, call_id)
-        except Exception:
-            return
-        await self._safe_send(websocket, {"type": "call", "call": call})
-
-    async def broadcast_calls(self) -> None:
-        calls = list_visible_calls(self.config)
-        for agent_id in list(self.agent_connections):
-            websocket = self.agent_connections.get(agent_id)
-            if websocket:
-                await self._safe_send(
-                    websocket, {"type": "snapshot", "calls": calls}
-                )
-        for call_id in list(self.caller_connections):
-            await self.send_caller_call(call_id)
-
-    async def _safe_send(self, websocket: WebSocket, payload: dict) -> None:
-        try:
-            await websocket.send_json(payload)
-        except Exception:
-            return
+                dead.append(websocket)
+        if dead:
+            async with self._lock:
+                current = registry.get(principal_id)
+                if current is not None:
+                    for websocket in dead:
+                        current.discard(websocket)
+                    if not current:
+                        registry.pop(principal_id, None)

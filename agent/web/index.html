@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <title>ARTC 客服工作台</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <section id="loginView" class="login-view">
+      <main class="login-panel" aria-labelledby="loginTitle">
+        <div class="brand-block">
+          <span class="brand-mark" aria-hidden="true">AR</span>
+          <div>
+            <p class="eyebrow">ARTC</p>
+            <h1 id="loginTitle">客服工作台</h1>
+          </div>
+        </div>
+
+        <form id="loginForm" class="login-form">
+          <label for="username">客服账号</label>
+          <input
+            id="username"
+            name="username"
+            type="text"
+            autocomplete="username"
+            maxlength="64"
+            required
+            autofocus
+          >
+
+          <label for="password">密码</label>
+          <input
+            id="password"
+            name="password"
+            type="password"
+            autocomplete="current-password"
+            maxlength="256"
+            required
+          >
+
+          <p id="loginError" class="form-error" role="alert" hidden></p>
+          <button id="loginButton" class="button button-primary button-wide" type="submit" disabled>
+            登录
+          </button>
+        </form>
+
+        <p class="login-footnote">
+          阿里云 ARTC Web SDK · <a class="text-link-inline" href="/admin.html">管理员入口</a>
+        </p>
+      </main>
+    </section>
+
+    <div id="appView" class="app-shell" hidden>
+      <header class="app-header">
+        <div class="brand-block compact">
+          <span class="brand-mark" aria-hidden="true">AR</span>
+          <div>
+            <p class="eyebrow">ARTC</p>
+            <h1>客服工作台</h1>
+          </div>
+        </div>
+
+        <div class="header-meta">
+          <span id="controlState" class="status-pill neutral" data-state="connecting">
+            <span class="status-dot" aria-hidden="true"></span>
+            <span class="status-text">控制连接</span>
+          </span>
+          <span id="agentName" class="agent-name"></span>
+          <button id="logoutButton" class="button button-quiet" type="button">退出登录</button>
+        </div>
+      </header>
+
+      <div class="app-body">
+        <aside class="session-sidebar" aria-labelledby="sessionsTitle">
+          <div class="sidebar-heading">
+            <div>
+              <p class="eyebrow">实时会话</p>
+              <h2 id="sessionsTitle">业务语音会话</h2>
+            </div>
+            <button id="refreshSessionsButton" class="button button-quiet button-small" type="button">
+              刷新
+            </button>
+          </div>
+
+          <div id="sessionList" class="session-list" role="list"></div>
+          <p id="sessionEmpty" class="empty-copy">
+            暂无可接入会话
+          </p>
+        </aside>
+
+        <main class="workspace">
+          <section id="noSelection" class="workspace-empty">
+            <div class="empty-symbol" aria-hidden="true">◎</div>
+            <h2>选择业务会话</h2>
+            <p>当前没有选中的业务会话。</p>
+          </section>
+
+          <section id="sessionView" class="session-workspace" hidden>
+            <header class="session-header">
+              <div>
+                <p id="sessionScenario" class="eyebrow"></p>
+                <h2 id="sessionRobotName"></h2>
+                <p id="sessionMeta" class="muted-copy"></p>
+              </div>
+              <span id="sessionStatus" class="status-pill neutral"></span>
+            </header>
+
+            <div class="workspace-grid">
+              <section class="media-panel" aria-label="机器人媒体">
+                <div id="videoFrame" class="video-frame">
+                  <video id="remoteVideo" autoplay playsinline></video>
+                  <div id="videoEmpty" class="video-empty">
+                    <span class="video-symbol" aria-hidden="true">▣</span>
+                    <p id="videoEmptyText">摄像头未启用</p>
+                  </div>
+
+                  <div class="media-overlay">
+                    <span id="rtcState" class="media-chip">媒体未接入</span>
+                    <span id="audioState" class="media-chip">机器人音频等待中</span>
+                  </div>
+
+                  <button id="audioResumeButton" class="button button-light media-resume" type="button" hidden>
+                    恢复声音
+                  </button>
+                </div>
+
+                <div class="signal-strip">
+                  <div>
+                    <span class="signal-label">机器人麦克风</span>
+                    <strong id="robotMicState">未知</strong>
+                  </div>
+                  <div>
+                    <span class="signal-label">机器人摄像头</span>
+                    <strong id="robotCameraState">未知</strong>
+                  </div>
+                  <div>
+                    <span class="signal-label">客服监听</span>
+                    <strong id="listenState">未接入</strong>
+                  </div>
+                  <div>
+                    <span class="signal-label">客服麦克风</span>
+                    <strong id="microphoneState">关闭</strong>
+                  </div>
+                </div>
+              </section>
+
+              <aside class="control-panel" aria-label="接管控制">
+                <section class="control-section">
+                  <div class="section-heading">
+                    <div>
+                      <p class="eyebrow">人工接管</p>
+                      <h3 id="leaseTitle">未接管</h3>
+                    </div>
+                    <span id="leaseTimer" class="lease-timer">--</span>
+                  </div>
+                  <p id="leaseDescription" class="muted-copy">
+                    当前会话尚未由人工接管。
+                  </p>
+                  <div class="button-grid">
+                    <button id="takeoverButton" class="button button-primary" type="button">
+                      开始接管
+                    </button>
+                    <button id="releaseButton" class="button button-secondary" type="button" disabled>
+                      释放接管
+                    </button>
+                  </div>
+                </section>
+
+                <section class="control-section">
+                  <div class="section-heading">
+                    <div>
+                      <p class="eyebrow">客服音频</p>
+                      <h3 id="microphoneTitle">默认关闭</h3>
+                    </div>
+                    <span id="microphoneIndicator" class="mic-indicator" aria-hidden="true"></span>
+                  </div>
+                  <p id="microphoneDescription" class="muted-copy">
+                    尚未取得人工接管租约。
+                  </p>
+                  <button id="microphoneButton" class="button button-wide" type="button" disabled>
+                    开启麦克风
+                  </button>
+                </section>
+
+                <section class="control-section compact-section">
+                  <div class="inline-actions">
+                    <button id="listenButton" class="button button-secondary" type="button" disabled>
+                      停止听取
+                    </button>
+                    <button id="joinButton" class="button button-primary" type="button">
+                      开始处理
+                    </button>
+                    <button id="leaveButton" class="button button-danger" type="button" disabled>
+                      离开会话
+                    </button>
+                    <button id="endSessionButton" class="button button-danger" type="button" disabled>
+                      结束会话
+                    </button>
+                  </div>
+                </section>
+              </aside>
+            </div>
+          </section>
+        </main>
+      </div>
+    </div>
+
+    <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+    <script src="/vendor/aliyun-rtc-sdk.js"></script>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

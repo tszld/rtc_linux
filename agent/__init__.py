@@ -1,2 +1,1 @@
-"""PySide6 customer-service client."""
-
+"""ARTC Web 客服工作台静态资源。"""

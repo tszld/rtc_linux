@@ -1,251 +1,245 @@
 from __future__ import annotations
 
-import hashlib
-import secrets
 import sqlite3
+from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
-
-from .config import ServerConfig
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS agents (
+SCHEMA_VERSION = 3
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS scenarios (
     id TEXT PRIMARY KEY,
-    username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    display_name TEXT NOT NULL,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agent_sessions (
-    token_hash TEXT PRIMARY KEY,
-    agent_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    revoked_at TEXT,
-    FOREIGN KEY(agent_id) REFERENCES agents(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_agent_sessions_agent
-ON agent_sessions(agent_id, revoked_at, expires_at);
-
-CREATE TABLE IF NOT EXISTS admin_accounts (
-    id TEXT PRIMARY KEY,
-    username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
+    name TEXT UNIQUE NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS admin_sessions (
-    token_hash TEXT PRIMARY KEY,
-    admin_id TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    last_seen_at TEXT NOT NULL,
-    revoked_at TEXT,
-    FOREIGN KEY(admin_id) REFERENCES admin_accounts(id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_admin_sessions_admin
-ON admin_sessions(admin_id, revoked_at);
-
-CREATE TABLE IF NOT EXISTS clients (
+CREATE TABLE IF NOT EXISTS agents (
     id TEXT PRIMARY KEY,
-    installation_uuid TEXT NOT NULL UNIQUE,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
     display_name TEXT NOT NULL,
-    status TEXT NOT NULL,
-    credential_hash TEXT,
+    role TEXT NOT NULL CHECK (role IN ('agent', 'admin')),
+    enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    approved_at TEXT,
-    approved_by TEXT,
-    disabled_at TEXT,
-    status_reason TEXT,
-    FOREIGN KEY(approved_by) REFERENCES admin_accounts(id)
+    updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_clients_status_created
-ON clients(status, created_at);
-
-CREATE TABLE IF NOT EXISTS admin_audit_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    admin_id TEXT NOT NULL,
-    action TEXT NOT NULL,
-    target_type TEXT NOT NULL,
-    target_id TEXT NOT NULL,
-    result TEXT NOT NULL,
-    details_json TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(admin_id) REFERENCES admin_accounts(id)
+CREATE TABLE IF NOT EXISTS agent_scenarios (
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    scenario_id TEXT NOT NULL REFERENCES scenarios(id) ON DELETE CASCADE,
+    PRIMARY KEY (agent_id, scenario_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_admin_audit_created
-ON admin_audit_events(created_at);
-
-CREATE TABLE IF NOT EXISTS calls (
+CREATE TABLE IF NOT EXISTS robots (
     id TEXT PRIMARY KEY,
-    room_id TEXT NOT NULL UNIQUE,
-    caller_id TEXT NOT NULL,
-    caller_name TEXT NOT NULL,
-    caller_uid TEXT NOT NULL,
-    caller_token_hash TEXT NOT NULL,
-    status TEXT NOT NULL,
-    claimed_agent_id TEXT,
-    interrupted_side TEXT,
+    display_name TEXT NOT NULL,
+    scenario_id TEXT NOT NULL REFERENCES scenarios(id),
+    channel_id TEXT UNIQUE NOT NULL,
+    credential_hash TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'offline'
+        CHECK (status IN ('offline', 'online', 'degraded')),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    approved INTEGER NOT NULL DEFAULT 0,
+    last_seen_at TEXT,
+    deleted_at TEXT,
     created_at TEXT NOT NULL,
-    ready_at TEXT,
-    claimed_at TEXT,
-    connected_at TEXT,
-    interrupted_at TEXT,
-    ended_at TEXT,
-    end_reason TEXT,
-    updated_at TEXT NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1,
-    FOREIGN KEY(claimed_agent_id) REFERENCES agents(id)
+    updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_calls_status_created
-ON calls(status, created_at);
+CREATE TABLE IF NOT EXISTS robot_sessions (
+    id TEXT PRIMARY KEY,
+    robot_id TEXT NOT NULL REFERENCES robots(id),
+    status TEXT NOT NULL
+        CHECK (status IN ('active', 'agent_takeover', 'ended')),
+    claimed_by_agent_id TEXT,
+    claimed_at TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    end_reason TEXT
+);
 
-CREATE TABLE IF NOT EXISTS audit_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    call_id TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    actor_type TEXT NOT NULL,
-    actor_id TEXT,
-    metadata_json TEXT NOT NULL DEFAULT '{}',
+CREATE UNIQUE INDEX IF NOT EXISTS uq_robot_unfinished_session
+ON robot_sessions(robot_id)
+WHERE status IN ('active', 'agent_takeover');
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_agent_active_session_claim
+ON robot_sessions(claimed_by_agent_id)
+WHERE claimed_by_agent_id IS NOT NULL
+  AND status IN ('active', 'agent_takeover');
+
+CREATE TABLE IF NOT EXISTS takeover_leases (
+    id TEXT PRIMARY KEY,
+    robot_id TEXT NOT NULL REFERENCES robots(id),
+    session_id TEXT NOT NULL REFERENCES robot_sessions(id),
+    agent_id TEXT NOT NULL REFERENCES agents(id),
+    status TEXT NOT NULL CHECK (status IN ('active', 'released', 'expired')),
+    microphone_published INTEGER NOT NULL DEFAULT 0,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    released_at TEXT,
+    end_reason TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_robot_active_lease
+ON takeover_leases(robot_id)
+WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS robot_media_state (
+    robot_id TEXT PRIMARY KEY REFERENCES robots(id) ON DELETE CASCADE,
+    session_id TEXT REFERENCES robot_sessions(id),
+    microphone_published INTEGER NOT NULL DEFAULT 0,
+    camera_published INTEGER NOT NULL DEFAULT 0,
+    automatic_speech_paused INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_listeners (
+    session_id TEXT NOT NULL REFERENCES robot_sessions(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (session_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS access_tokens (
+    id TEXT PRIMARY KEY,
+    principal_type TEXT NOT NULL CHECK (principal_type IN ('agent', 'robot')),
+    principal_id TEXT NOT NULL,
+    token_hash TEXT UNIQUE NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT,
     created_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_call
-ON audit_events(call_id, id);
+CREATE INDEX IF NOT EXISTS idx_access_token_hash
+ON access_tokens(token_hash);
+
+CREATE TABLE IF NOT EXISTS ws_tickets (
+    id TEXT PRIMARY KEY,
+    principal_type TEXT NOT NULL CHECK (principal_type IN ('agent', 'robot')),
+    principal_id TEXT NOT NULL,
+    ticket_hash TEXT UNIQUE NOT NULL,
+    expires_at TEXT NOT NULL,
+    consumed_at TEXT,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ws_ticket_hash
+ON ws_tickets(ticket_hash);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor_type TEXT NOT NULL,
+    actor_id TEXT,
+    action TEXT NOT NULL,
+    target_type TEXT NOT NULL,
+    target_id TEXT,
+    metadata_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created_at
+ON audit_events(created_at DESC);
 """
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+class Database:
+    def __init__(self, path: Path | str) -> None:
+        self.path = Path(path).expanduser().resolve()
 
-
-def iso_time(value: datetime | None = None) -> str:
-    return (value or utc_now()).isoformat()
-
-
-def parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(value)
-
-
-def hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    iterations = 260_000
-    digest = hashlib.pbkdf2_hmac(
-        "sha256", password.encode("utf-8"), salt.encode("ascii"), iterations
-    ).hex()
-    return f"pbkdf2_sha256${iterations}${salt}${digest}"
-
-
-def verify_password(password: str, encoded: str) -> bool:
-    try:
-        algorithm, iteration_text, salt, expected = encoded.split("$", 3)
-        if algorithm != "pbkdf2_sha256":
-            return False
-        digest = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt.encode("ascii"),
-            int(iteration_text),
-        ).hex()
-        return secrets.compare_digest(digest, expected)
-    except (TypeError, ValueError):
-        return False
-
-
-def connect(config: ServerConfig) -> sqlite3.Connection:
-    config.db_path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(config.db_path, timeout=15)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 15000")
-    connection.execute("PRAGMA journal_mode = WAL")
-    return connection
-
-
-@contextmanager
-def db_session(config: ServerConfig) -> Iterator[sqlite3.Connection]:
-    connection = connect(config)
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-
-
-def initialize_database(config: ServerConfig, *, end_stale_calls: bool = True) -> None:
-    with db_session(config) as connection:
-        connection.executescript(SCHEMA)
-        existing = connection.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
-        if existing == 0:
-            now = iso_time()
-            for item in config.seed_agents:
-                connection.execute(
-                    """
-                    INSERT INTO agents
-                    (id, username, password_hash, display_name, enabled, created_at)
-                    VALUES (?, ?, ?, ?, 1, ?)
-                    """,
-                    (
-                        "agent-" + secrets.token_hex(8),
-                        item["username"],
-                        hash_password(item["password"]),
-                        item.get("display_name", item["username"]),
-                        now,
-                    ),
+    def initialize(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connection() as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version == 0:
+                connection.executescript(SCHEMA_SQL)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                connection.commit()
+            elif version in {1, 2}:
+                if version == 1:
+                    self._migrate_v1_to_v2(connection)
+                self._migrate_v2_to_v3(connection)
+            elif version != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"不支持的数据库版本 {version}，期望 {SCHEMA_VERSION}"
                 )
-        if end_stale_calls:
-            now = iso_time()
+
+    @staticmethod
+    def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "ALTER TABLE robots ADD COLUMN deleted_at TEXT"
+            )
+            connection.execute(
+                "ALTER TABLE robot_sessions "
+                "ADD COLUMN claimed_by_agent_id TEXT"
+            )
+            connection.execute(
+                "ALTER TABLE robot_sessions ADD COLUMN claimed_at TEXT"
+            )
             connection.execute(
                 """
-                UPDATE calls
-                SET status = 'ended',
-                    ended_at = ?,
-                    end_reason = 'backend_restart',
-                    updated_at = ?,
-                    version = version + 1
-                WHERE status IN ('created', 'waiting', 'connecting', 'active', 'interrupted')
-                """,
-                (now, now),
+                CREATE UNIQUE INDEX uq_agent_active_session_claim
+                ON robot_sessions(claimed_by_agent_id)
+                WHERE claimed_by_agent_id IS NOT NULL
+                  AND status IN ('active', 'agent_takeover')
+                """
             )
+            connection.execute("PRAGMA user_version = 2")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
+    @staticmethod
+    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                "ALTER TABLE takeover_leases "
+                "ADD COLUMN microphone_published INTEGER NOT NULL DEFAULT 0"
+            )
+            connection.execute("PRAGMA user_version = 3")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
-def add_audit(
-    connection: sqlite3.Connection,
-    call_id: str,
-    event_type: str,
-    actor_type: str,
-    actor_id: str | None,
-    metadata_json: str = "{}",
-) -> None:
-    connection.execute(
-        """
-        INSERT INTO audit_events
-        (call_id, event_type, actor_type, actor_id, metadata_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (call_id, event_type, actor_type, actor_id, metadata_json, iso_time()),
-    )
+    def _open_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            self.path,
+            timeout=5,
+            isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        return connection
 
+    @contextmanager
+    def connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._open_connection()
+        try:
+            yield connection
+        finally:
+            connection.close()
 
-def duration_deadline(seconds: int) -> str:
-    return iso_time(utc_now() + timedelta(seconds=seconds))
+    @contextmanager
+    def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        connection = self._open_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()

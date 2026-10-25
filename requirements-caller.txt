@@ -1,3 +1,0 @@
-# The caller launcher uses only the Python standard library.
-# DingRTC is loaded as a static browser JavaScript SDK from web/sdk.js,
-# so the caller has no pip dependencies.

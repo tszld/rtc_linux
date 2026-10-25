@@ -1,599 +1,552 @@
 from __future__ import annotations
 
-import json
-import secrets
 import sqlite3
 import uuid
-from dataclasses import dataclass
 from typing import Any
 
-from .config import ServerConfig
-from .db import (
-    db_session,
-    hash_password,
-    hash_token,
-    iso_time,
-    verify_password,
-)
+from .audit import insert_audit
+from .auth import Principal, revoke_principal_tokens
+from .db import Database
+from .errors import ConflictError, ForbiddenError, NotFoundError
+from .robots import robot_to_dict
+from .security import hash_password, hash_secret, new_secret, utc_now_text
+from .sessions import end_sessions_for_offline_robot
 
 
-class AdminError(Exception):
-    def __init__(self, message: str, status_code: int = 400):
-        super().__init__(message)
-        self.message = message
-        self.status_code = status_code
+def _agent_to_dict(
+    row: sqlite3.Row,
+    scenario_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    result = {
+        "id": row["id"],
+        "username": row["username"],
+        "displayName": row["display_name"],
+        "role": row["role"],
+        "enabled": bool(row["enabled"]),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+    if scenario_ids is not None:
+        result["scenarioIds"] = scenario_ids
+    return result
 
 
-@dataclass(frozen=True)
-class AdminIdentity:
-    id: str
-    username: str
-    token_hash: str
-
-
-def _admin_identity(row, token_hash: str) -> AdminIdentity:
-    return AdminIdentity(
-        id=row["id"],
-        username=row["username"],
-        token_hash=token_hash,
-    )
-
-
-def create_initial_admin(
-    config: ServerConfig,
-    *,
-    username: str,
-    password: str,
-) -> AdminIdentity:
-    username = username.strip()
-    if not username:
-        raise AdminError("管理员用户名不能为空")
-    if not password:
-        raise AdminError("管理员密码不能为空")
-    now = iso_time()
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        if connection.execute("SELECT COUNT(*) FROM admin_accounts").fetchone()[0]:
-            raise AdminError("超级管理员已经存在", 409)
-        admin_id = "admin-" + uuid.uuid4().hex[:16]
-        connection.execute(
-            """
-            INSERT INTO admin_accounts
-            (id, username, password_hash, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, 1, ?, ?)
-            """,
-            (admin_id, username, hash_password(password), now, now),
-        )
-        row = connection.execute(
-            "SELECT id, username FROM admin_accounts WHERE id = ?",
-            (admin_id,),
-        ).fetchone()
-        return AdminIdentity(id=row["id"], username=row["username"], token_hash="")
-
-
-def reset_initial_admin_password(
-    config: ServerConfig,
-    *,
-    username: str,
-    password: str,
-) -> None:
-    username = username.strip()
-    if not password:
-        raise AdminError("管理员密码不能为空")
-    now = iso_time()
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute(
-            "SELECT id FROM admin_accounts WHERE username = ?",
-            (username,),
-        ).fetchone()
-        if not row:
-            raise AdminError("超级管理员不存在", 404)
-        connection.execute(
-            "UPDATE admin_accounts SET password_hash = ?, updated_at = ? WHERE id = ?",
-            (hash_password(password), now, row["id"]),
-        )
-        connection.execute(
-            """
-            UPDATE admin_sessions
-            SET revoked_at = COALESCE(revoked_at, ?)
-            WHERE admin_id = ? AND revoked_at IS NULL
-            """,
-            (now, row["id"]),
-        )
-
-
-def login_admin(
-    config: ServerConfig,
-    *,
-    username: str,
-    password: str,
-) -> tuple[str, AdminIdentity]:
-    now = iso_time()
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute(
-            """
-            SELECT id, username, password_hash, enabled
-            FROM admin_accounts
-            WHERE username = ?
-            """,
-            (username,),
-        ).fetchone()
-        if not row or not row["enabled"] or not verify_password(
-            password, row["password_hash"]
-        ):
-            raise AdminError("管理员账号或密码错误", 401)
-        connection.execute(
-            """
-            UPDATE admin_sessions
-            SET revoked_at = COALESCE(revoked_at, ?)
-            WHERE admin_id = ? AND revoked_at IS NULL
-            """,
-            (now, row["id"]),
-        )
-        token = secrets.token_urlsafe(40)
-        token_hash = hash_token(token)
-        connection.execute(
-            """
-            INSERT INTO admin_sessions
-            (token_hash, admin_id, created_at, last_seen_at)
-            VALUES (?, ?, ?, ?)
-            """,
-            (token_hash, row["id"], now, now),
-        )
-        return token, _admin_identity(row, token_hash)
-
-
-def authenticate_admin(
-    config: ServerConfig,
-    token: str,
-    *,
-    touch: bool = True,
-) -> AdminIdentity:
-    if not token:
-        raise AdminError("缺少管理员访问凭证", 401)
-    token_hash = hash_token(token)
-    now = iso_time()
-    with db_session(config) as connection:
-        row = connection.execute(
-            """
-            SELECT a.id, a.username, a.enabled, s.revoked_at
-            FROM admin_sessions s
-            JOIN admin_accounts a ON a.id = s.admin_id
-            WHERE s.token_hash = ?
-            """,
-            (token_hash,),
-        ).fetchone()
-        if not row or not row["enabled"] or row["revoked_at"] is not None:
-            raise AdminError("管理员访问凭证已失效", 401)
-        if touch:
-            connection.execute(
-                "UPDATE admin_sessions SET last_seen_at = ? WHERE token_hash = ?",
-                (now, token_hash),
-            )
-        return _admin_identity(row, token_hash)
-
-
-def logout_admin(config: ServerConfig, token_hash: str) -> None:
-    with db_session(config) as connection:
-        connection.execute(
-            """
-            UPDATE admin_sessions
-            SET revoked_at = COALESCE(revoked_at, ?)
-            WHERE token_hash = ?
-            """,
-            (iso_time(), token_hash),
-        )
-
-
-def _audit(
-    connection: sqlite3.Connection,
-    *,
-    admin: AdminIdentity,
-    action: str,
-    target_type: str,
-    target_id: str,
-    details: dict[str, Any] | None = None,
-) -> None:
-    connection.execute(
-        """
-        INSERT INTO admin_audit_events
-        (admin_id, action, target_type, target_id, result, details_json, created_at)
-        VALUES (?, ?, ?, ?, 'success', ?, ?)
-        """,
-        (
-            admin.id,
-            action,
-            target_type,
-            target_id,
-            json.dumps(details or {}, ensure_ascii=False, separators=(",", ":")),
-            iso_time(),
-        ),
-    )
-
-
-def list_agents(config: ServerConfig) -> list[dict[str, Any]]:
-    with db_session(config) as connection:
+def list_agents(db: Database) -> list[dict[str, Any]]:
+    with db.connection() as connection:
         rows = connection.execute(
-            """
-            SELECT id, username, display_name, enabled, created_at
-            FROM agents
-            ORDER BY created_at, username
-            """
+            "SELECT * FROM agents ORDER BY username"
         ).fetchall()
-        return [
-            {
-                "id": row["id"],
-                "username": row["username"],
-                "displayName": row["display_name"],
-                "enabled": bool(row["enabled"]),
-                "createdAt": row["created_at"],
-            }
-            for row in rows
-        ]
+        mappings = connection.execute(
+            "SELECT agent_id, scenario_id FROM agent_scenarios"
+        ).fetchall()
+    scenario_map: dict[str, list[str]] = {}
+    for mapping in mappings:
+        scenario_map.setdefault(mapping["agent_id"], []).append(
+            mapping["scenario_id"]
+        )
+    return [
+        _agent_to_dict(row, scenario_map.get(row["id"], []))
+        for row in rows
+    ]
 
 
 def create_agent(
-    config: ServerConfig,
-    admin: AdminIdentity,
+    db: Database,
     *,
+    actor: Principal,
     username: str,
-    display_name: str,
     password: str,
+    display_name: str,
+    scenario_ids: list[str],
 ) -> dict[str, Any]:
-    if not password:
-        raise AdminError("客服密码不能为空")
-    now = iso_time()
-    agent_id = "agent-" + uuid.uuid4().hex[:16]
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        existing = connection.execute(
-            "SELECT id FROM agents WHERE username = ?",
-            (username,),
-        ).fetchone()
-        if existing:
-            raise AdminError("客服用户名已存在", 409)
-        connection.execute(
-            """
-            INSERT INTO agents
-            (id, username, password_hash, display_name, enabled, created_at)
-            VALUES (?, ?, ?, ?, 1, ?)
-            """,
-            (agent_id, username, hash_password(password), display_name, now),
-        )
-        _audit(
-            connection,
-            admin=admin,
-            action="agent_create",
-            target_type="agent",
-            target_id=agent_id,
-            details={"username": username},
-        )
-        return {
-            "id": agent_id,
-            "username": username,
-            "displayName": display_name,
-            "enabled": True,
-            "createdAt": now,
-        }
-
-
-def update_agent_display_name(
-    config: ServerConfig,
-    admin: AdminIdentity,
-    *,
-    agent_id: str,
-    display_name: str,
-) -> None:
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        changed = connection.execute(
-            "UPDATE agents SET display_name = ? WHERE id = ?",
-            (display_name, agent_id),
-        ).rowcount
-        if not changed:
-            raise AdminError("客服不存在", 404)
-        _audit(
-            connection,
-            admin=admin,
-            action="agent_update",
-            target_type="agent",
-            target_id=agent_id,
-            details={"displayName": display_name},
-        )
-
-
-def reset_agent_password(
-    config: ServerConfig,
-    admin: AdminIdentity,
-    *,
-    agent_id: str,
-    password: str,
-) -> None:
-    if not password:
-        raise AdminError("客服密码不能为空")
-    now = iso_time()
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        changed = connection.execute(
-            "UPDATE agents SET password_hash = ? WHERE id = ?",
-            (hash_password(password), agent_id),
-        ).rowcount
-        if not changed:
-            raise AdminError("客服不存在", 404)
-        connection.execute(
-            """
-            UPDATE agent_sessions
-            SET revoked_at = COALESCE(revoked_at, ?)
-            WHERE agent_id = ? AND revoked_at IS NULL
-            """,
-            (now, agent_id),
-        )
-        _audit(
-            connection,
-            admin=admin,
-            action="agent_password_reset",
-            target_type="agent",
-            target_id=agent_id,
-        )
+    clean_username = username.strip()
+    clean_display_name = display_name.strip()
+    if not clean_username or not clean_display_name:
+        raise ValueError("用户名和显示名称不能为空")
+    if len(password) < 8:
+        raise ValueError("客服密码至少 8 个字符")
+    scenario_ids = list(dict.fromkeys(scenario_ids))
+    agent_id = str(uuid.uuid4())
+    now = utc_now_text()
+    try:
+        with db.transaction(immediate=True) as connection:
+            if scenario_ids:
+                placeholders = ",".join("?" for _ in scenario_ids)
+                found = connection.execute(
+                    f"SELECT id FROM scenarios WHERE id IN ({placeholders})",
+                    scenario_ids,
+                ).fetchall()
+                if len(found) != len(scenario_ids):
+                    raise NotFoundError("包含不存在的场景")
+            connection.execute(
+                """
+                INSERT INTO agents (
+                    id, username, password_hash, display_name,
+                    role, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'agent', 1, ?, ?)
+                """,
+                (
+                    agent_id,
+                    clean_username,
+                    hash_password(password),
+                    clean_display_name,
+                    now,
+                    now,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO agent_scenarios (agent_id, scenario_id) VALUES (?, ?)",
+                [(agent_id, scenario_id) for scenario_id in scenario_ids],
+            )
+            insert_audit(
+                connection,
+                actor_type="agent",
+                actor_id=actor.id,
+                action="agent_created",
+                target_type="agent",
+                target_id=agent_id,
+                metadata={"username": clean_username},
+            )
+            row = connection.execute(
+                "SELECT * FROM agents WHERE id = ?",
+                (agent_id,),
+            ).fetchone()
+    except sqlite3.IntegrityError as exc:
+        raise ConflictError("用户名已存在") from exc
+    return _agent_to_dict(row, scenario_ids)
 
 
 def set_agent_enabled(
-    config: ServerConfig,
-    admin: AdminIdentity,
+    db: Database,
     *,
+    actor: Principal,
     agent_id: str,
     enabled: bool,
-) -> None:
-    now = iso_time()
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
+) -> dict[str, Any]:
+    now = utc_now_text()
+    with db.transaction(immediate=True) as connection:
         row = connection.execute(
-            "SELECT id FROM agents WHERE id = ?",
+            "SELECT * FROM agents WHERE id = ?",
             (agent_id,),
         ).fetchone()
-        if not row:
-            raise AdminError("客服不存在", 404)
-        if not enabled:
-            busy = connection.execute(
-                """
-                SELECT id FROM calls
-                WHERE claimed_agent_id = ?
-                  AND status IN ('connecting', 'active', 'interrupted')
-                LIMIT 1
-                """,
-                (agent_id,),
-            ).fetchone()
-            if busy:
-                raise AdminError("客服正在处理会话，不能停用", 409)
+        if row is None:
+            raise NotFoundError("客服账号不存在")
+        if row["id"] == actor.id and not enabled:
+            raise ForbiddenError("管理员不能停用当前登录账号")
         connection.execute(
-            "UPDATE agents SET enabled = ? WHERE id = ?",
-            (1 if enabled else 0, agent_id),
+            "UPDATE agents SET enabled = ?, updated_at = ? WHERE id = ?",
+            (int(enabled), now, agent_id),
         )
-        if not enabled:
-            connection.execute(
-                """
-                UPDATE agent_sessions
-                SET revoked_at = COALESCE(revoked_at, ?)
-                WHERE agent_id = ? AND revoked_at IS NULL
-                """,
-                (now, agent_id),
-            )
-        _audit(
+        revoke_principal_tokens(
             connection,
-            admin=admin,
-            action="agent_enable" if enabled else "agent_disable",
+            principal_type="agent",
+            principal_id=agent_id,
+        )
+        insert_audit(
+            connection,
+            actor_type="agent",
+            actor_id=actor.id,
+            action="agent_enabled" if enabled else "agent_disabled",
             target_type="agent",
             target_id=agent_id,
         )
-
-
-def list_admin_clients(
-    config: ServerConfig,
-    *,
-    status: str | None = None,
-) -> list[dict[str, Any]]:
-    where = ""
-    params: tuple[str, ...] = ()
-    if status:
-        where = "WHERE c.status = ?"
-        params = (status,)
-    with db_session(config) as connection:
-        rows = connection.execute(
-            f"""
-            SELECT c.*, (
-                SELECT call.id FROM calls AS call
-                WHERE call.caller_id = c.id
-                  AND call.status IN ('created', 'waiting', 'connecting', 'active', 'interrupted')
-                ORDER BY call.created_at DESC
-                LIMIT 1
-            ) AS active_call_id
-            FROM clients AS c
-            {where}
-            ORDER BY
-                CASE c.status
-                    WHEN 'pending' THEN 0
-                    WHEN 'approved' THEN 1
-                    WHEN 'disabled' THEN 2
-                    ELSE 3
-                END,
-                c.created_at
-            """,
-            params,
-        ).fetchall()
-        return [
-            {
-                "id": row["id"],
-                "installationUuid": row["installation_uuid"],
-                "displayName": row["display_name"],
-                "status": row["status"],
-                "availability": "busy" if row["active_call_id"] else "idle",
-                "currentCallId": row["active_call_id"],
-                "credentialConfigured": row["credential_hash"] is not None,
-                "createdAt": row["created_at"],
-                "updatedAt": row["updated_at"],
-                "statusReason": row["status_reason"],
-            }
-            for row in rows
-        ]
-
-
-def update_client_display_name(
-    config: ServerConfig,
-    admin: AdminIdentity,
-    *,
-    client_id: str,
-    display_name: str,
-) -> None:
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        changed = connection.execute(
-            "UPDATE clients SET display_name = ?, updated_at = ? WHERE id = ?",
-            (display_name, iso_time(), client_id),
-        ).rowcount
-        if not changed:
-            raise AdminError("客户端不存在", 404)
-        _audit(
-            connection,
-            admin=admin,
-            action="client_update",
-            target_type="client",
-            target_id=client_id,
-            details={"displayName": display_name},
-        )
-
-
-def set_client_status(
-    config: ServerConfig,
-    admin: AdminIdentity,
-    *,
-    client_id: str,
-    status: str,
-    reason: str | None = None,
-) -> None:
-    if status not in {"approved", "rejected", "disabled"}:
-        raise AdminError("不支持的客户端状态")
-    now = iso_time()
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        row = connection.execute(
-            "SELECT id FROM clients WHERE id = ?",
-            (client_id,),
+        updated = connection.execute(
+            "SELECT * FROM agents WHERE id = ?",
+            (agent_id,),
         ).fetchone()
-        if not row:
-            raise AdminError("客户端不存在", 404)
-        if status in {"rejected", "disabled"}:
-            busy = connection.execute(
-                """
-                SELECT id FROM calls
-                WHERE caller_id = ?
-                  AND status IN ('created', 'waiting', 'connecting', 'active', 'interrupted')
-                LIMIT 1
-                """,
-                (client_id,),
-            ).fetchone()
-            if busy:
-                raise AdminError("客户端存在未结束会话，不能拒绝或停用", 409)
+    payload = _agent_to_dict(updated)
+    if not enabled:
+        from .takeover import release_all_for_agent
+
+        released = release_all_for_agent(
+            db,
+            agent_id=agent_id,
+            reason="agent_disabled",
+        )
+        payload["releasedLeases"] = released["leases"]
+        payload["listenerUpdates"] = released["listenerUpdates"]
+        payload["claimUpdates"] = released["claimUpdates"]
+    return payload
+
+
+def list_admin_robots(db: Database) -> list[dict[str, Any]]:
+    with db.connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT robots.*, scenarios.name AS scenario_name
+            FROM robots
+            JOIN scenarios ON scenarios.id = robots.scenario_id
+            WHERE robots.deleted_at IS NULL
+            ORDER BY scenarios.name, robots.display_name
+            """
+        ).fetchall()
+    return [robot_to_dict(row) for row in rows]
+
+
+def create_robot(
+    db: Database,
+    *,
+    actor: Principal,
+    display_name: str,
+    scenario_id: str,
+) -> dict[str, Any]:
+    clean_name = display_name.strip()
+    if not clean_name:
+        raise ValueError("机器人显示名称不能为空")
+    robot_id = str(uuid.uuid4())
+    channel_id = "rtc-" + uuid.uuid4().hex
+    credential = new_secret(32)
+    now = utc_now_text()
+    with db.transaction(immediate=True) as connection:
+        scenario = connection.execute(
+            "SELECT * FROM scenarios WHERE id = ?",
+            (scenario_id,),
+        ).fetchone()
+        if scenario is None:
+            raise NotFoundError("场景不存在")
         connection.execute(
             """
-            UPDATE clients
-            SET status = ?, updated_at = ?, status_reason = ?,
-                approved_at = CASE WHEN ? = 'approved' THEN ? ELSE NULL END,
-                approved_by = CASE WHEN ? = 'approved' THEN ? ELSE NULL END,
-                disabled_at = CASE WHEN ? = 'disabled' THEN ? ELSE NULL END
-            WHERE id = ?
+            INSERT INTO robots (
+                id, display_name, scenario_id, channel_id,
+                credential_hash, status, enabled, approved,
+                last_seen_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'offline', 1, 0, NULL, ?, ?)
             """,
             (
-                status,
+                robot_id,
+                clean_name,
+                scenario_id,
+                channel_id,
+                hash_secret(credential),
                 now,
-                reason,
-                status,
                 now,
-                status,
-                admin.id,
-                status,
-                now,
-                client_id,
             ),
         )
-        _audit(
+        insert_audit(
             connection,
-            admin=admin,
-            action=f"client_{status}",
-            target_type="client",
-            target_id=client_id,
-            details={"reason": reason} if reason else None,
+            actor_type="agent",
+            actor_id=actor.id,
+            action="robot_created",
+            target_type="robot",
+            target_id=robot_id,
+            metadata={"scenarioId": scenario_id},
         )
-
-
-def reset_client_credential(
-    config: ServerConfig,
-    admin: AdminIdentity,
-    *,
-    client_id: str,
-) -> None:
-    now = iso_time()
-    with db_session(config) as connection:
-        connection.execute("BEGIN IMMEDIATE")
-        busy = connection.execute(
+        row = connection.execute(
             """
-            SELECT id FROM calls
-            WHERE caller_id = ?
-              AND status IN ('created', 'waiting', 'connecting', 'active', 'interrupted')
-            LIMIT 1
+            SELECT robots.*, scenarios.name AS scenario_name
+            FROM robots
+            JOIN scenarios ON scenarios.id = robots.scenario_id
+            WHERE robots.id = ?
             """,
-            (client_id,),
+            (robot_id,),
         ).fetchone()
-        if busy:
-            raise AdminError("客户端存在未结束会话，不能重置凭证", 409)
-        changed = connection.execute(
+    payload = robot_to_dict(row)
+    payload["robotId"] = robot_id
+    payload["credential"] = credential
+    return payload
+
+
+def rename_robot(
+    db: Database,
+    *,
+    actor: Principal,
+    robot_id: str,
+    display_name: str,
+) -> dict[str, Any]:
+    clean_name = display_name.strip()
+    if not clean_name:
+        raise ValueError("机器人显示名称不能为空")
+    if len(clean_name) > 128:
+        raise ValueError("机器人显示名称不能超过 128 个字符")
+    now = utc_now_text()
+    with db.transaction(immediate=True) as connection:
+        robot = connection.execute(
             """
-            UPDATE clients
-            SET credential_hash = NULL, status = 'pending', updated_at = ?,
-                approved_at = NULL, approved_by = NULL, disabled_at = NULL,
-                status_reason = 'credential_reset'
+            SELECT * FROM robots
+            WHERE id = ? AND deleted_at IS NULL
+            """,
+            (robot_id,),
+        ).fetchone()
+        if robot is None:
+            raise NotFoundError("机器人不存在")
+        old_name = robot["display_name"]
+        connection.execute(
+            "UPDATE robots SET display_name = ?, updated_at = ? WHERE id = ?",
+            (clean_name, now, robot_id),
+        )
+        insert_audit(
+            connection,
+            actor_type="agent",
+            actor_id=actor.id,
+            action="robot_renamed",
+            target_type="robot",
+            target_id=robot_id,
+            metadata={"oldDisplayName": old_name, "newDisplayName": clean_name},
+        )
+        row = connection.execute(
+            """
+            SELECT robots.*, scenarios.name AS scenario_name
+            FROM robots
+            JOIN scenarios ON scenarios.id = robots.scenario_id
+            WHERE robots.id = ?
+            """,
+            (robot_id,),
+        ).fetchone()
+    return robot_to_dict(row)
+
+
+def delete_robot(
+    db: Database,
+    *,
+    actor: Principal,
+    robot_id: str,
+) -> dict[str, Any]:
+    now = utc_now_text()
+    with db.transaction(immediate=True) as connection:
+        robot = connection.execute(
+            """
+            SELECT * FROM robots
+            WHERE id = ? AND deleted_at IS NULL
+            """,
+            (robot_id,),
+        ).fetchone()
+        if robot is None:
+            raise NotFoundError("机器人不存在")
+        connection.execute(
+            """
+            UPDATE robots
+            SET enabled = 0, approved = 0, status = 'offline',
+                deleted_at = ?, updated_at = ?
             WHERE id = ?
             """,
-            (now, client_id),
-        ).rowcount
-        if not changed:
-            raise AdminError("客户端不存在", 404)
-        _audit(
-            connection,
-            admin=admin,
-            action="client_credential_reset",
-            target_type="client",
-            target_id=client_id,
+            (now, now, robot_id),
         )
+        revoke_principal_tokens(
+            connection,
+            principal_type="robot",
+            principal_id=robot_id,
+        )
+        insert_audit(
+            connection,
+            actor_type="agent",
+            actor_id=actor.id,
+            action="robot_deleted",
+            target_type="robot",
+            target_id=robot_id,
+            metadata={"displayName": robot["display_name"]},
+        )
+    ended_sessions = end_sessions_for_offline_robot(
+        db,
+        robot_id=robot_id,
+        reason="robot_deleted",
+    )
+    return {
+        "robotId": robot_id,
+        "displayName": robot["display_name"],
+        "endedSessions": ended_sessions,
+    }
 
 
-def list_admin_audit(
-    config: ServerConfig,
+def set_robot_approval(
+    db: Database,
     *,
-    limit: int = 200,
-) -> list[dict[str, Any]]:
-    with db_session(config) as connection:
-        rows = connection.execute(
+    actor: Principal,
+    robot_id: str,
+    approved: bool,
+) -> dict[str, Any]:
+    now = utc_now_text()
+    with db.transaction(immediate=True) as connection:
+        robot = connection.execute(
+            "SELECT * FROM robots WHERE id = ? AND deleted_at IS NULL",
+            (robot_id,),
+        ).fetchone()
+        if robot is None:
+            raise NotFoundError("机器人不存在")
+        connection.execute(
             """
-            SELECT id, admin_id, action, target_type, target_id,
-                   result, details_json, created_at
-            FROM admin_audit_events
-            ORDER BY id DESC
-            LIMIT ?
+            UPDATE robots
+            SET approved = ?,
+                status = CASE WHEN ? = 0 THEN 'offline' ELSE status END,
+                updated_at = ?
+            WHERE id = ?
             """,
-            (max(1, min(limit, 1000)),),
-        ).fetchall()
-        return [
-            {
-                "id": row["id"],
-                "adminId": row["admin_id"],
-                "action": row["action"],
-                "targetType": row["target_type"],
-                "targetId": row["target_id"],
-                "result": row["result"],
-                "details": json.loads(row["details_json"]),
-                "createdAt": row["created_at"],
-            }
-            for row in rows
-        ]
+            (int(approved), int(approved), now, robot_id),
+        )
+        if not approved:
+            revoke_principal_tokens(
+                connection,
+                principal_type="robot",
+                principal_id=robot_id,
+            )
+        insert_audit(
+            connection,
+            actor_type="agent",
+            actor_id=actor.id,
+            action="robot_approved" if approved else "robot_rejected",
+            target_type="robot",
+            target_id=robot_id,
+        )
+        row = connection.execute(
+            """
+            SELECT robots.*, scenarios.name AS scenario_name
+            FROM robots
+            JOIN scenarios ON scenarios.id = robots.scenario_id
+            WHERE robots.id = ?
+            """,
+            (robot_id,),
+        ).fetchone()
+    return robot_to_dict(row)
+
+
+def set_robot_enabled(
+    db: Database,
+    *,
+    actor: Principal,
+    robot_id: str,
+    enabled: bool,
+) -> dict[str, Any]:
+    now = utc_now_text()
+    ended_sessions: list[dict[str, Any]] = []
+    with db.transaction(immediate=True) as connection:
+        robot = connection.execute(
+            "SELECT * FROM robots WHERE id = ? AND deleted_at IS NULL",
+            (robot_id,),
+        ).fetchone()
+        if robot is None:
+            raise NotFoundError("机器人不存在")
+        connection.execute(
+            """
+            UPDATE robots
+            SET enabled = ?, status = CASE WHEN ? = 0 THEN 'offline' ELSE status END,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (int(enabled), int(enabled), now, robot_id),
+        )
+        if not enabled:
+            revoke_principal_tokens(
+                connection,
+                principal_type="robot",
+                principal_id=robot_id,
+            )
+        insert_audit(
+            connection,
+            actor_type="agent",
+            actor_id=actor.id,
+            action="robot_enabled" if enabled else "robot_disabled",
+            target_type="robot",
+            target_id=robot_id,
+        )
+    if not enabled:
+        ended_sessions = end_sessions_for_offline_robot(
+            db,
+            robot_id=robot_id,
+            reason="robot_disabled",
+        )
+    row = _robot_admin_row(db, robot_id)
+    payload = robot_to_dict(row)
+    payload["endedSessions"] = ended_sessions
+    return payload
+
+
+def set_robot_scenario(
+    db: Database,
+    *,
+    actor: Principal,
+    robot_id: str,
+    scenario_id: str,
+) -> dict[str, Any]:
+    now = utc_now_text()
+    with db.transaction(immediate=True) as connection:
+        robot = connection.execute(
+            "SELECT * FROM robots WHERE id = ? AND deleted_at IS NULL",
+            (robot_id,),
+        ).fetchone()
+        if robot is None:
+            raise NotFoundError("机器人不存在")
+        active = connection.execute(
+            """
+            SELECT 1 FROM robot_sessions
+            WHERE robot_id = ? AND status IN ('active', 'agent_takeover')
+            """,
+            (robot_id,),
+        ).fetchone()
+        if active is not None:
+            raise ConflictError("业务会话进行中不能切换场景")
+        scenario = connection.execute(
+            "SELECT 1 FROM scenarios WHERE id = ?",
+            (scenario_id,),
+        ).fetchone()
+        if scenario is None:
+            raise NotFoundError("场景不存在")
+        connection.execute(
+            """
+            UPDATE robots SET scenario_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (scenario_id, now, robot_id),
+        )
+        insert_audit(
+            connection,
+            actor_type="agent",
+            actor_id=actor.id,
+            action="robot_scenario_changed",
+            target_type="robot",
+            target_id=robot_id,
+            metadata={"scenarioId": scenario_id},
+        )
+    return robot_to_dict(_robot_admin_row(db, robot_id))
+
+
+def rotate_robot_credential(
+    db: Database,
+    *,
+    actor: Principal,
+    robot_id: str,
+) -> dict[str, str]:
+    credential = new_secret(32)
+    now = utc_now_text()
+    with db.transaction(immediate=True) as connection:
+        robot = connection.execute(
+            "SELECT 1 FROM robots WHERE id = ? AND deleted_at IS NULL",
+            (robot_id,),
+        ).fetchone()
+        if robot is None:
+            raise NotFoundError("机器人不存在")
+        connection.execute(
+            """
+            UPDATE robots SET credential_hash = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (hash_secret(credential), now, robot_id),
+        )
+        revoke_principal_tokens(
+            connection,
+            principal_type="robot",
+            principal_id=robot_id,
+        )
+        insert_audit(
+            connection,
+            actor_type="agent",
+            actor_id=actor.id,
+            action="robot_credential_rotated",
+            target_type="robot",
+            target_id=robot_id,
+        )
+    return {"robotId": robot_id, "credential": credential}
+
+
+def _robot_admin_row(db: Database, robot_id: str) -> sqlite3.Row:
+    with db.connection() as connection:
+        row = connection.execute(
+            """
+            SELECT robots.*, scenarios.name AS scenario_name
+            FROM robots
+            JOIN scenarios ON scenarios.id = robots.scenario_id
+            WHERE robots.id = ? AND robots.deleted_at IS NULL
+            """,
+            (robot_id,),
+        ).fetchone()
+    if row is None:
+        raise NotFoundError("机器人不存在")
+    return row

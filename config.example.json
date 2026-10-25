@@ -1,0 +1,39 @@
+{
+  "cluster": {
+    "control_url": "http://100.64.0.1:8000"
+  },
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "app_id": "<ARTC AppID>",
+    "app_key": "<ARTC AppKey>",
+    "db_path": "server/data/artc.db",
+    "access_token_ttl_seconds": 43200,
+    "token_ttl_seconds": 600,
+    "ws_ticket_ttl_seconds": 30,
+    "presence_degraded_seconds": 15,
+    "presence_timeout_seconds": 30,
+    "takeover_lease_seconds": 60,
+    "max_takeover_lease_seconds": 300,
+    "cors_origins": []
+  },
+  "agent": {
+    "host": "127.0.0.1",
+    "port": 8100,
+    "auto_open_browser": true
+  },
+  "robot": {
+    "robot_id": "<robot-id>",
+    "credential": "<robot-credential>",
+    "display_name": "<robot-display-name>",
+    "sdk_root": "robot/vendor/AliRTCSDK_Linux-7.11.0",
+    "log_dir": "/tmp/artc-robot-logs",
+    "heartbeat_seconds": 5,
+    "reconnect_seconds": 2,
+    "auto_start_session": true,
+    "exit_when_session_ends": true,
+    "audio_output": true,
+    "test_tone_frequency": null,
+    "camera_enabled": false
+  }
+}

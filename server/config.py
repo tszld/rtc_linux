@@ -1,104 +1,140 @@
 from __future__ import annotations
 
-import json
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+from project_config import ROOT, get_section, reject_unknown_keys
 
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-SERVER_DIR = ROOT_DIR / "server"
-
-
-def resolve_project_path(value: str | Path) -> Path:
-    path = Path(value).expanduser()
-    if not path.is_absolute():
-        path = ROOT_DIR / path
-    return path.resolve()
-
-
-@dataclass
+@dataclass(frozen=True)
 class ServerConfig:
-    app_id: str = "cn4zs9jm"
-    app_key: str = ""
-    db_path: Path = Path("server/data/rtc.db")
+    app_id: str
+    app_key: str
+    db_path: Path
     host: str = "0.0.0.0"
     port: int = 8000
-    rtc_token_ttl_seconds: int = 3600
-    agent_presence_ttl_seconds: int = 20
-    ws_ticket_ttl_seconds: int = 60
-    connecting_timeout_seconds: int = 45
-    interrupted_timeout_seconds: int = 15
-    created_timeout_seconds: int = 120
-    cors_origin_regex: str = r"http://(127\.0\.0\.1|localhost)(:\d+)?"
-    seed_agents: list[dict[str, str]] = field(
-        default_factory=lambda: [
+    access_token_ttl_seconds: int = 12 * 60 * 60
+    rtc_token_ttl_seconds: int = 10 * 60
+    ws_ticket_ttl_seconds: int = 30
+    presence_degraded_seconds: int = 15
+    presence_timeout_seconds: int = 30
+    takeover_lease_seconds: int = 60
+    max_takeover_lease_seconds: int = 300
+    cors_origins: tuple[str, ...] = ()
+
+    @property
+    def rtc_configured(self) -> bool:
+        return bool(self.app_id and self.app_key)
+
+    @classmethod
+    def load(
+        cls,
+        config_path: Path | str | None = None,
+    ) -> ServerConfig:
+        values: dict[str, Any] = get_section("server", config_path)
+        reject_unknown_keys(
+            "server",
+            values,
             {
-                "username": "agent01",
-                "password": "agent123",
-                "display_name": "客服 01",
+                "app_id",
+                "app_key",
+                "db_path",
+                "host",
+                "port",
+                "access_token_ttl_seconds",
+                "token_ttl_seconds",
+                "ws_ticket_ttl_seconds",
+                "presence_degraded_seconds",
+                "presence_timeout_seconds",
+                "takeover_lease_seconds",
+                "max_takeover_lease_seconds",
+                "cors_origins",
             },
-            {
-                "username": "agent02",
-                "password": "agent123",
-                "display_name": "客服 02",
-            },
-        ]
-    )
-
-    def __post_init__(self) -> None:
-        self.db_path = resolve_project_path(self.db_path)
-
-
-def _load_json(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
-def load_config() -> ServerConfig:
-    config = ServerConfig()
-    for candidate in (SERVER_DIR / "config.json", SERVER_DIR / "config.local.json"):
-        values = _load_json(candidate)
-        for key, value in values.items():
-            if hasattr(config, key):
-                setattr(config, key, value)
-
-    config.app_id = os.getenv("RTC_APP_ID", config.app_id)
-    config.app_key = os.getenv("RTC_APP_KEY", config.app_key)
-    config.host = os.getenv("RTC_HOST", config.host)
-    config.port = int(os.getenv("RTC_PORT", str(config.port)))
-    config.db_path = resolve_project_path(
-        os.getenv("RTC_DB_PATH", str(config.db_path))
-    )
-    config.rtc_token_ttl_seconds = int(
-        os.getenv("RTC_TOKEN_TTL_SECONDS", str(config.rtc_token_ttl_seconds))
-    )
-    config.agent_presence_ttl_seconds = int(
-        os.getenv("RTC_AGENT_PRESENCE_TTL_SECONDS", str(config.agent_presence_ttl_seconds))
-    )
-    config.ws_ticket_ttl_seconds = int(
-        os.getenv("RTC_WS_TICKET_TTL_SECONDS", str(config.ws_ticket_ttl_seconds))
-    )
-    config.connecting_timeout_seconds = int(
-        os.getenv(
-            "RTC_CONNECTING_TIMEOUT_SECONDS", str(config.connecting_timeout_seconds)
         )
-    )
-    config.interrupted_timeout_seconds = int(
-        os.getenv(
-            "RTC_INTERRUPTED_TIMEOUT_SECONDS", str(config.interrupted_timeout_seconds)
-        )
-    )
-    config.created_timeout_seconds = int(
-        os.getenv("RTC_CREATED_TIMEOUT_SECONDS", str(config.created_timeout_seconds))
-    )
-    config.cors_origin_regex = os.getenv(
-        "RTC_CORS_ORIGIN_REGEX", config.cors_origin_regex
-    )
 
-    seed_json = os.getenv("RTC_AGENT_SEED_JSON")
-    if seed_json:
-        config.seed_agents = json.loads(seed_json)
-    return config
+        def text_value(name: str, default: str = "") -> str:
+            return str(values.get(name, default)).strip()
+
+        def int_value(name: str, default: int) -> int:
+            raw = values.get(name, default)
+            try:
+                return int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"server.{name} 必须是整数") from exc
+
+        db_value = text_value("db_path", "server/data/artc.db")
+        db_path = Path(db_value).expanduser()
+        if not db_path.is_absolute():
+            db_path = (ROOT / db_path).resolve()
+
+        raw_origins = values.get("cors_origins", [])
+        if not isinstance(raw_origins, list):
+            raise ValueError("server.cors_origins 必须是字符串数组")
+        cors_origins = tuple(str(item).strip() for item in raw_origins)
+
+        config = cls(
+            app_id=text_value("app_id"),
+            app_key=text_value("app_key"),
+            db_path=db_path,
+            host=text_value("host", "0.0.0.0"),
+            port=int_value("port", 8000),
+            access_token_ttl_seconds=int_value(
+                "access_token_ttl_seconds",
+                12 * 60 * 60,
+            ),
+            rtc_token_ttl_seconds=int_value("token_ttl_seconds", 10 * 60),
+            ws_ticket_ttl_seconds=int_value("ws_ticket_ttl_seconds", 30),
+            presence_degraded_seconds=int_value(
+                "presence_degraded_seconds",
+                15,
+            ),
+            presence_timeout_seconds=int_value(
+                "presence_timeout_seconds",
+                30,
+            ),
+            takeover_lease_seconds=int_value("takeover_lease_seconds", 60),
+            max_takeover_lease_seconds=int_value(
+                "max_takeover_lease_seconds",
+                300,
+            ),
+            cors_origins=cors_origins,
+        )
+        config.validate()
+        return config
+
+    def validate(self) -> None:
+        integer_fields = {
+            "port": self.port,
+            "access_token_ttl_seconds": self.access_token_ttl_seconds,
+            "rtc_token_ttl_seconds": self.rtc_token_ttl_seconds,
+            "ws_ticket_ttl_seconds": self.ws_ticket_ttl_seconds,
+            "presence_degraded_seconds": self.presence_degraded_seconds,
+            "presence_timeout_seconds": self.presence_timeout_seconds,
+            "takeover_lease_seconds": self.takeover_lease_seconds,
+            "max_takeover_lease_seconds": self.max_takeover_lease_seconds,
+        }
+        for name, value in integer_fields.items():
+            if value <= 0:
+                raise ValueError(f"{name} 必须大于 0")
+        if self.port > 65535:
+            raise ValueError("port 不能大于 65535")
+        if not self.host:
+            raise ValueError("server.host 不能为空")
+        if self.presence_degraded_seconds >= self.presence_timeout_seconds:
+            raise ValueError(
+                "presence_degraded_seconds 必须小于 presence_timeout_seconds"
+            )
+        if self.takeover_lease_seconds > self.max_takeover_lease_seconds:
+            raise ValueError("默认接管租约不能大于最大租约")
+        for origin in self.cors_origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(f"cors_origins 包含无效来源：{origin}")

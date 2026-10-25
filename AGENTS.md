@@ -1,199 +1,288 @@
-# RTC 项目协作规则
+# 业务语音机器人与客服协作项目规则
 
-本文件是本项目的窗口级接手入口。开始工作前先读本文件，再按当前任务读取
-`TASKS.md`、`README.md` 和相关源码。`TASKS.md` 保留了迁移前的原始计划，其中
-旧的路径和 `.venv` 命令属于历史内容；发生冲突时，以本文件、当前代码和实际验证
-结果为准。
+本文件是新窗口的接手入口，定义当前 ARTC 项目的协作规则和实现边界。
 
-## 1. 项目目标与范围
+开始工作前依次读取：
 
-这是一个局域网优先的 RTC 呼叫原型，由三部分组成：
+1. 本文件。
+2. `TASKS.md`。
+3. `README.md`。
+4. 当前任务涉及的 `server/`、`robot/`、`agent/` 和 `tests/` 源码。
 
-- `caller/`：呼叫端本机网页，负责发起呼叫、发布麦克风、共享屏幕、显示会话状态和挂断。
-- `agent/`：PySide6 客服与管理员端，负责客服登录、客户端目录、接听、管理账号和客户端。
-- `server/`：FastAPI 集中控制面，负责客服/管理员账号、客户端注册审批、会话状态、
-  DingRTC Token 和 WebSocket 推送。
+## 1. 全局硬性规则
 
-当前范围包含双向音频、呼叫端到客服端的单向屏幕共享、客户端注册审批和轻量管理后台。
-不包含摄像头视频、在线心跳、控制流、真实机器人、Electron、公网 TLS 和媒体录制。
+以下操作必须先停止并向用户确认：
 
-固定架构约束：
+- 新增重要第三方依赖或商业 SDK。
+- 修改公共接口。
+- 修改核心数据模型或数据库结构。
+- 大幅调整目录或模块边界。
+- 删除功能、文件或数据。
+- 更换核心技术方案。
+- 大范围重构。
+- 不可逆操作。
+- 需求存在会实质影响结果的歧义。
 
-- 后端只做控制面，不转发音频或视频。
-- 呼叫端和客服端直接加入同一个 DingRTC 房间。
-- 所有客服共享同一个后端和同一份 SQLite 会话状态。
-- 当前是单进程 SQLite 原型，不为本阶段引入 PostgreSQL、Redis、消息队列、
-  Docker 或多 Uvicorn worker。
+同时必须遵守：
 
-## 2. 运行环境
+- 不编造 API、命令、依赖、配置、版本或项目事实。
+- 修改文件前先读取相关实现，不根据历史聊天猜测。
+- 未实际验证不得声称完成。
+- 未经明确要求，不执行 `git commit` 或 `git push`。
+- 未经明确要求，不删除文件或数据。
+- 不硬编码或泄露密码、Token、API Key、AppKey。
+- 不扩大当前任务，不顺手修改无关代码。
 
-项目要求 Python 3.10.x，当前验证版本为 3.10.22。优先激活已经安装项目依赖的
-Python 环境；也可以使用相对路径指定解释器：
+## 2. MVM 与工作单元
 
-```powershell
-$env:RTC_PYTHON = ".\runtime\python.exe"
+每次实现都追求：
+
+> 最小、完整、真实、可运行、可验证、可理解。
+
+- 从现有骨架做最小完整增量。
+- 不提前实现未来可能需要的扩展机制。
+- 抽象必须有真实重复或明确复杂度支撑。
+- 代码优先级为：正确性 > 可读性 > 执行流程清晰 > 可维护性 > 简单性 >
+  性能 > 抽象与扩展性。
+- 重要外部调用、状态转换和并发边界必须在代码中直接可见。
+- 一个工作单元必须能用一组命令和明确验收条件验证。
+
+## 3. 新目标架构
+
+目标是业务语音机器人与人工客服协作平台，包含两个 Linux 运行组件、一个浏览器
+客服工作台和阿里云 ARTC：
+
+```text
+robot/  Linux 机器人端
+        ARTC Linux Python SDK
+        业务语音会话、麦克风、扬声器、可选摄像头
+
+server/ Linux 业务后端
+        FastAPI + SQLite
+        身份、业务场景、机器人目录、Token、在线状态、接管锁、审计
+
+agent/web/  Web 客服工作台
+        阿里云 ARTC Web SDK
+        独立静态服务、业务会话查看、人工接管和浏览器媒体状态
+
+阿里云 ARTC
+        音视频媒体传输，不经过业务后端
 ```
 
-相对路径以项目根目录为基准。根目录 `.venv/` 是已弃用的历史环境，不要继续使用，
-也不要在未获明确要求时删除。
+机器人内部的 ASR、NLU、对话模型和 TTS 属于机器人业务应用，不在本项目的媒体与控制
+链路范围内。本项目负责把机器人语音和可选摄像头接入 ARTC，并协调人工客服接管。
 
-安装或更新已验证依赖：
+### 固定架构约束
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\setup.ps1
+- ARTC 只负责媒体和频道能力，不负责排队、派单、审批或业务审计。
+- 业务后端只做控制面，不转发、转码、录制或保存音视频。
+- 每台机器人使用独立 ARTC 频道。
+- 机器人端使用 ARTC Linux Python SDK。
+- 客服端使用阿里云 ARTC Web SDK，由独立 `agent` Web 服务托管；页面跨源调用控制端。
+- 业务后端、机器人端和测试工具部署在 Linux；客服 Web 服务和浏览器可运行在同一台
+  Windows 或 Linux 电脑上。
+- 同一频道两端使用不同且稳定的 `userId`。
+- AppKey 只允许存在于未跟踪根目录 `config.json` 的 `server` 节。
+- 客服端和机器人端只能获得短期 ARTC Token。
+- ARTC Token 主要认证频道和用户；人工接管独占锁由业务后端保证，除非后续确认
+  ARTC Token 能直接限制发布权限，否则不得宣称 Token 已完成接管权限隔离。
+- 所有机器人/客服共享一个逻辑业务后端，不允许每个客服各部署一套。
+- 当前阶段只使用阿里云 ARTC Linux Python SDK 和 ARTC Web SDK，不引入原生 Windows
+  媒体客户端、PostgreSQL、Redis、消息队列、Docker 或多 Uvicorn worker；确有需要时
+  先确认。
+
+## 4. 业务状态与并发约束
+
+### 机器人状态
+
+机器人连接状态：
+
+```text
+offline <-> online -> degraded
 ```
 
-依赖按组件拆分：`requirements-server.txt` 用于 Linux/FastAPI 控制端，
-`requirements-agent.txt` 用于 Windows/PySide6 客服端，`requirements-caller.txt`
-仅说明呼叫端无 pip 依赖；`requirements.txt` 是 Windows 全量开发环境。
-`setup.ps1` 可通过 `-Component all|server|agent|caller` 选择组件。
+- `online`：机器人控制连接在线且心跳未过期。
+- `offline`：心跳过期或主动离线。
+- 一个活动会话只允许一名客服原子认领；一个客服同时最多认领一个活动会话。
+- ARTC 频道在线状态是辅助证据，不能替代业务心跳。
 
-标准自动化测试：
+业务语音会话状态：
 
-```powershell
-python -m unittest discover -s tests -v
+```text
+active <-> agent_takeover
+   |
+   +-> ended
 ```
 
-Python 语法检查：
+- `active`：机器人正在执行自动业务语音会话。
+- `agent_takeover`：客服持有人工接管租约并暂时替代自动语音。
+- `ended`：本次业务语音会话结束。
 
-```powershell
-python -m compileall -q server agent caller tests
-```
+### 媒体规则
 
-前端脚本语法检查：
+- 机器人麦克风只在可见的业务语音会话中发布，空闲时关闭。
+- 客服麦克风默认静音。
+- 客服获得人工接管锁后才允许开启客服麦克风。
+- 同一机器人同一时间只允许一个客服人工接管。
+- 客服只能接入自己已认领的会话；未认领和已被其他客服占用的会话不可接入。
+- 人工接管期间，机器人应暂停自动业务语音/TTS，并播放客服音频；释放后恢复业务状态。
+- 不允许隐蔽监听。机器人和客服界面必须显示麦克风、人工接管和可选摄像头状态。
+- 业务语音、人工接管和可选摄像头功能必须支持明确停止。
 
-```powershell
-node --check .\caller\web\app.js
-node --check .\agent\rtc\rtc.js
-node --check .\agent\rtc\qwebchannel.js
-```
+### 人工接管锁
 
-启动入口：
+- 接管申请、续租、释放必须在数据库事务中完成。
+- 同一机器人只能有一个有效人工接管租约。
+- 客服断线、租约过期或主动结束时必须释放租约。
+- 锁状态变化必须通过 WebSocket 广播给相关客服和机器人。
+- 前端按钮禁用不能替代后端原子校验。
 
-```powershell
-python -X utf8 main.py server
-python -X utf8 main.py agent
-python -X utf8 main.py caller
-```
-
-后端默认监听 `0.0.0.0:8000`。呼叫页面固定从本机
-`http://127.0.0.1:8765` 加载，才能可靠保存 Origin、浏览器权限和客户端身份；
-页面再访问电脑 B 的集中后端。
-
-## 3. 模块职责与修改边界
+## 5. 目录职责
 
 ### `server/`
 
-- `app.py`：HTTP/WebSocket 路由和应用生命周期。
-- `auth.py`：客服登录和访问令牌。
-- `admin.py`：超级管理员、客服账号管理和管理员审计。
-- `clients.py`：客户端注册、审批状态、设备凭证和客服客户端目录。
-- `calls.py`：会话创建、认领、状态流转、断线、恢复和超时。
-- `db.py`：SQLite 初始化和事务辅助。
-- `config.py`：配置加载和环境变量覆盖。
-- `rtc.py`：DingRTC Token 生成。
-- `ws_manager.py`：WebSocket 连接、票据和状态广播。
-- `token/`：DingRTC Token 生成依赖，视为外部算法实现，不做无关改动。
+- `app.py`：HTTP 和 WebSocket 路由、生命周期。
+- `auth.py`：客服和机器人认证、访问 Token。
+- `admin.py`：超级管理员、客服账号和审计。
+- `robots.py`：机器人注册、审批、状态、场景归属和目录。
+- `scenarios.py`：应用场景及权限。
+- `presence.py`：心跳、在线状态和超时。
+- `takeover.py`：人工接管租约、并发认领和释放。
+- `rtc.py`：ARTC 单参数 Token 生成。
+- `db.py`：SQLite schema、事务和迁移辅助。
+- `ws_manager.py`：WebSocket 连接、一次性票据和状态推送。
 
-修改后端行为时必须优先保持状态机和鉴权语义，不以界面现象代替事务正确性。
+### `robot/`
+
+新建 Linux 机器人客户端：
+
+- ARTC Linux Python SDK 适配。
+- 机器人身份和设备凭证。
+- 心跳和业务 WebSocket。
+- 业务语音会话和可选摄像头发布。
+- 客服音频接收和扬声器播放。
+- 活动业务会话中默认发布机器人麦克风。
+- 可见运行状态和错误日志。
+- 不保存 AppKey，不自行生成生产 Token。
 
 ### `agent/`
 
-- `main.py`：PySide6 客服/管理员登录、客户端目录、会话列表、管理页面和 WebSocket。
-- `api.py`：客服端 HTTP 客户端。
-- `rtc_panel.py`：QtWebEngine RTC 页面宿主和权限处理。
-- `rtc/`：客服端 RTC 页面、WebChannel 桥接和麦克风控制。
+`agent/` 是独立的浏览器客服工作台，`server/` 不托管页面：
 
-不要在客服端保存或打印 AppKey，也不要绕过后端的会话认领接口直接加入房间。
+- 使用阿里云 ARTC Web SDK，脚本版本和完整性固定在仓库内。
+- `agent/web_host.py` 默认监听 `127.0.0.1:8100`，只提供页面、脚本和运行时配置。
+- 页面通过 `backend_url` 指定的 REST 和 WebSocket 访问控制端。
+- 登录字段和访问 Token 只保存在页面内存，不使用浏览器持久化存储。
+- 选择并查看有权限的业务会话。
+- 人工接管锁申请和释放。
+- 客服麦克风和摄像头在入会前关闭，取得接管租约后才允许发布麦克风。
+- 页面显示机器人媒体、客服收听、接管、麦克风和可选摄像头状态。
+- `/admin.html` 提供机器人审批、客服账号和审计管理页面；业务场景字段内部保留但
+  默认隐藏。
+- 机器人启动后可自动注册为待审批，管理员审批后才能登录。
 
-### `caller/`
+## 6. 接口与数据原则
 
-- `launcher.py`：固定端口本机静态页面、Installation UUID 和设备凭证持久化。
-- `web/`：客户端注册审批、状态展示、DingRTC 音频与屏幕发布和 WebSocket 重连。
+- 机器人业务语音会话使用独立状态模型，不复用呼叫状态机。
+- 数据库初始阶段可继续使用 SQLite，但事务必须正确处理并发认领。
+- API 字段使用清晰的 camelCase 输出，数据库字段使用 snake_case。
+- Token、密码、设备凭证只保存哈希，不保存明文。
+- ARTC Token 默认短期有效，并设计过期刷新。
+- WebSocket 只发送控制状态，不发送媒体数据。
+- 日志不得打印完整 Token、设备凭证、密码或 AppKey。
+- 公共接口变化必须先记录在当前任务并取得用户确认。
 
-呼叫页面不能直接请求局域网 HTTP RTC 能力；麦克风入口必须是本机
-`127.0.0.1`/`localhost` 页面。修改呼叫流程时不得改变后端公共接口。
+## 7. 运行环境和命令
 
-### `tests/`
+控制端和机器人端只支持 Linux；客服 Web 服务支持 Windows 和 Linux。各部分均要求
+Python 3.10.x，路径以项目根目录为基准。
 
-- 自动化测试不访问 DingRTC 云服务。
-- 后端状态机、鉴权、并发、超时和 WebSocket 行为应有可重复测试。
-- 真实音频、屏幕共享、真实设备和真实网络问题属于人工验收，不能由单元测试替代。
+统一入口：
 
-## 4. 会话状态机与安全约束
-
-核心状态为：
-
-```text
-created -> waiting -> connecting -> active -> ended
-                         |
-                         +-> waiting
-
-connecting/active -> interrupted -> connecting/active/waiting/ended
+```bash
+python main.py
+python main.py server
+python main.py robot
+python main.py agent
 ```
 
-必须保持以下不变量：
+入口统一读取未跟踪的根目录 `config.json`，模板为 `config.example.json`，不在命令
+中传 JSON 路径。`config.json` 使用 `cluster/server/agent/robot` 分节；控制端
+`server.host="tailscale"` 时自动解析 Tailscale IPv4。`agent` 入口启动独立客服 Web
+服务，默认地址为 `http://127.0.0.1:8100/`。Windows 客服浏览器和 Web 服务在同一台
+电脑时使用 localhost；连接地址统一来自 `cluster.control_url`。
 
-- 只有 `waiting` 可以通过原子操作变为 `connecting`。
-- 一个客服不能并发登录，也不能同时占用多个会话。
-- 接听前不加入 RTC，不申请或发布客服麦克风。
-- 任意一方主动挂断后，会话立即进入 `ended`，双方退出 RTC。
-- 呼叫客户端连接断开后立即结束会话，不进入 caller `interrupted`。
-- 客服异常断线进入 `interrupted`，默认保留 15 秒；超时结束会话。
-- 客服重启后可认领并恢复自己的 `interrupted` 会话。
-- 客户端创建呼叫必须同时校验 Installation UUID 和设备凭证。
-- 呼叫端结束和查询自己的会话必须使用本次 caller token 校验。
-- WebSocket 票据是一次性的，并有过期时间。
-- 后端重启时，所有未结束会话必须被明确收尾，不能遗留假活动状态。
-- 数据库只保存 token 哈希，不保存明文密码或明文 caller token。
+标准测试：
 
-安全检查：
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q server robot agent tools tests
+```
 
-- DingRTC AppKey 只能来自后端环境变量 `RTC_APP_KEY` 或不进版本控制的
-  `server/config.local.json`。
-- AppKey 不得进入网页、PySide6 配置、日志、响应、测试输出或提交内容。
-- 不支持公网部署。公网使用前必须增加 HTTPS/WSS、域名、证书、账号安全和限流。
-- 不硬编码其他密码、Token、API Key 或敏感信息。
+Linux ARTC Python SDK 不是普通 pip 包。真实机器人验证必须在 Linux 环境使用官方
+SDK 包，包含 `AliRtcCoreService` 和 `libAliRtcLinuxEngine.so`。
 
-## 5. 配置与网络
+真实 Linux 机器人 + Web 客服跨 SDK 媒体联调：
 
-- 后端默认配置：`server/config.json`。
-- 后端本地秘密：`server/config.local.json`，必须保持被 git 忽略。
-- 客服端配置：`agent/config.json`。
-- 呼叫端配置：`caller/config.json`。
-- 客户端身份和设备凭证：`caller/config.local.json`，必须保持被 git 忽略。
-- 开发账号目前为 `agent01/agent123` 和 `agent02/agent123`，仅适合局域网原型。
-- 超级管理员不预置，使用 `main.py server --create-admin` 创建。
-- 客服电脑需允许同一局域网访问 TCP `8000`；不要扩大到不必要的来源。
-- 电脑 A 和电脑 B 都必须能够访问 DingRTC 云服务。
+在 Linux 启动控制端和机器人，使用与服务器网络连通的 Chrome 或 Edge 打开
+`agent` 服务地址，分别验证机器人音频、人工接管、客服麦克风和可选视频。
 
-## 6. 当前阶段状态
+## 8. 测试与验收
 
-最近更新日期：2026-10-20。
+自动化测试不访问真实 ARTC 云：
 
-- `T0`：已完成，源码已迁移到 `D:\Projects\rtc`。
-- `T1`：已完成。后端事务、并发接听、超时、WebSocket 票据、断线恢复和重启收尾
-  已加固；当前完整自动化测试达到 `50/50` 通过。
-- `T2`：自动化和模拟验证已完成主要部分，包括 WebChannel 事件桥接、双客服同步、
-  同账号重复登录拒绝、入会中挂断清理和重启恢复；真实桌面麦克风权限、真实
-  DingRTC 入会和真实音频尚未验收。
-- `T3`：按用户要求暂停。新窗口不得自动继续 T3，必须等用户明确恢复。
-- `T4`：环境阻塞。当前未配置真实 AppKey，也没有两台电脑、真实麦克风和真实
-  双向 DingRTC 条件，不能宣称端到端音频通过。
-- `T5`：部分完成。启动脚本和 README 已切换到指定环境；`requirements.lock.txt`、
-  完整秘密扫描、忽略规则复核和最终交付检查仍未完成。
+- 后端认证、授权、场景隔离、心跳超时和并发人工接管锁必须有测试。
+- ARTC Token 生成用固定输入测试格式，不记录真实 AppKey。
+- 机器人 SDK 必须提供可替换的适配接口和假实现。
+- Web 客服静态路由、SDK 版本完整性、默认关闭发布和控制面约束必须有测试。
+- 控制端不得托管客服页面；跨源访问必须由 `cors_origins` 明确允许。
 
-`TASKS.md` 中的历史状态不代表当前完成度；每次汇报必须区分“代码已修改”、
-“自动化已验证”和“真实设备已验收”。
+真实设备验收：
 
-## 7. 新窗口接手规则
+- Linux 机器人业务语音；摄像头按业务配置验证。
+- 浏览器客服入会、机器人音频播放和客服麦克风发布。
+- 客服人工接管到机器人扬声器。
+- 机器人默认麦克风回传。
+- Token 过期刷新。
+- 网络断开和重连。
+- 两个客服并发申请人工接管时只有一个成功。
+- 长时间运行无音视频泄漏和进程残留。
 
-1. 先读本文件、`README.md`、`TASKS.md` 和当前任务相关源码。
-2. 先检查工作树状态，保留用户已有修改，不覆盖、不回滚无关文件。
-3. 确认当前只执行用户明确指定的任务。T3 当前暂停，不得顺手启动或修改。
-4. 修改前说明目标、修改边界和验证方式；小范围、低风险实现自行完成。
-5. 用户未明确要求时，不提交、不推送、不删除文件、不新增重要依赖、不修改公共
-   接口、核心数据模型或模块边界。
-6. 完成后必须给出修改文件、实际执行的命令和验证结果。无法执行的真实设备或
-   网络验收要明确列为阻塞，不能用模拟结果替代。
-7. 当前任务验证完成后停止，不主动扩大范围。
+自动化测试不能替代真实 ARTC、摄像头、麦克风和扬声器验收。
+
+## 9. 安全与隐私边界
+
+- 不允许隐藏采集或秘密监听。
+- 麦克风、人工接管和可选摄像头必须有可见状态。
+- 生产环境 AppKey 只存在后端。
+- 公网部署必须使用 HTTPS/WSS、域名、证书、限流和账号安全。
+- 业务后端不得成为媒体中继。
+- 不保存音视频内容。
+- 真实设备 ID、机器人位置和场景信息按最小必要原则返回。
+
+## 10. 当前项目事实
+
+最近更新日期：2026-10-23。
+
+- 当前分支：`artc`。
+- 当前工作树包含 Linux 机器人端、Linux 业务后端、跨 Windows/Linux 的 Web 客服
+  工作台、测试和工具。
+- 控制端、机器人端和 Web 客服工作台保留三个独立入口；客服 Web 页面由 `agent` 独立
+  托管，控制端只提供 REST/WebSocket 控制面。
+- 原 Linux Python 客服端及其终端联调工具已移除。
+- ARTC Web SDK 固定为 `7.3.4`，随仓库提供并校验 SHA-256。
+- T1-T6 的业务后端、并发接管、机器人业务运行器、Web 客服、管理员和审计代码
+  已落地；T7/T8 自动化、联调和安全检查工具已提供。
+- Linux 机器人 + Web 客服跨 SDK 真实音频、物理麦克风和视频尚未完成验收。
+- Windows 客服浏览器与 Linux 控制端之间的 Tailscale 控制链路需要实机验收。
+- 网络重连和长时间运行尚未完成验收。
+
+## 11. 接手和执行纪律
+
+1. 先检查 `git status`，保留用户已有修改。
+2. 只执行 `TASKS.md` 中用户明确指定的任务。
+3. 修改前说明目标、边界、验证方式。
+4. 先完成 PoC 闸门，再建设业务平台。
+5. 出现公共接口、数据模型或技术路线变化时先确认。
+6. 完成后给出修改文件、实际命令、通过项和未验证项。
+7. 当前工作完成后停止，不自动启动下一阶段。

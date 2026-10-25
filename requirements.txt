@@ -1,5 +1,0 @@
-# Complete Windows development environment for all three runtime components.
-# The caller has no pip dependencies, but its file is included for consistency.
--r requirements-server.txt
--r requirements-agent.txt
--r requirements-caller.txt

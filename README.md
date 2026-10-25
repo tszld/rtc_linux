@@ -1,262 +1,483 @@
-# RTC 客服调度原型
+# ARTC 业务语音机器人与客服协作平台
 
-局域网优先的 RTC 呼叫原型，包含三个组件：
+项目由 Linux 机器人端、Linux 业务控制端和浏览器客服工作台组成。机器人媒体使用
+阿里云 ARTC Linux Python SDK，客服媒体使用阿里云 ARTC Web SDK，业务后端不转发或
+保存音视频。
 
-- `caller/`：呼叫电脑上的固定端口本机网页客户端，自动注册并等待管理员审批。
-- `agent/`：PySide6 客服与管理员端，内嵌 QtWebEngine 运行 DingRTC Web SDK。
-- `server/`：FastAPI 集中后端，处理账号、客户端审批、房间状态、原子接听和 RTC Token，不转发音视频。
+## 架构
+
+```text
+robot/       Linux ARTC Python SDK 机器人
+server/      FastAPI + SQLite 业务控制面
+agent/web/   ARTC Web SDK 浏览器客服工作台
+agent/web_host.py
+             独立客服 Web 静态服务
+agent/web/vendor/aliyun-rtc-sdk.js
+             阿里云 ARTC Web SDK 7.3.4
+tools/       Token、机器人联调和秘密扫描工具
+```
+
+业务后端只负责身份、场景权限、机器人目录、在线状态、业务会话、人工接管租约、短期
+ARTC Token、WebSocket 状态和审计，不托管客服页面。客服 Web 页面和 ARTC Web SDK
+由独立的 `agent` 进程提供，浏览器再跨源访问控制端。
+
+## 首次部署：按顺序完成三个端
+
+首次部署不要同时启动三个端。按下面的顺序操作，前一步验证通过后再做下一步。
+
+| 顺序 | 主机 | 组件 | 作用 |
+|---|---|---|---|
+| 1 | Linux 控制端 | `server` | 共享业务后端、SQLite、Token 和 WebSocket |
+| 2 | Windows 客服电脑 | `agent` | 客服页面和管理员页面 |
+| 3 | 各 Linux 机器人主机 | `robot` | ARTC 媒体、麦克风和机器人扬声器 |
+
+控制端、客服电脑和每台机器人主机都必须能访问控制端的 `cluster.control_url`。使用
+Tailscale 时，这些主机都要登录同一个 tailnet。
+
+端口只承担控制面：
+
+```text
+控制端       监听 0.0.0.0:8000（通过 Tailscale-IP:8000 访问）
+Windows 客服  仅监听 127.0.0.1:8100
+机器人端      不监听业务控制端口
+ARTC 媒体     机器人/客服直接连接阿里云，不经过控制端
+```
+
+### 第 1 步：部署 Linux 控制端
+
+进入控制端项目目录，在已有的 `rtc` Python 环境中操作：
+
+```bash
+conda activate rtc
+python --version
+python -m pip install -r requirements-server.txt
+```
+
+在项目根目录创建 `config.json`。控制端只配置 `server` 节，`AppID`、`AppKey` 和
+数据库只放在控制端：
+
+```json
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "app_id": "<ARTC AppID>",
+    "app_key": "<ARTC AppKey>",
+    "db_path": "server/data/artc.db",
+    "cors_origins": ["http://127.0.0.1:8100"]
+  }
+}
+```
+
+首次创建数据库和管理员：
+
+```bash
+chmod 600 config.json
+python main.py server --create-admin admin
+```
+
+该命令会提示两次输入管理员密码，密码不会写入配置文件。随后启动控制端：
+
+```bash
+python main.py server
+```
+
+另开终端验证：
+
+```bash
+curl http://<控制端Tailscale-IP>:8000/api/health
+```
+
+看到 `{"ok":true,...}` 后再继续。
+
+### 第 2 步：启动 Windows 客服和管理员页面
+
+在 Windows 项目根目录创建 `config.json`，只配置共享控制地址和 `agent` 节。这里不
+需要 AppKey、数据库和机器人凭证：
+
+```json
+{
+  "cluster": {
+    "control_url": "http://<控制端Tailscale-IP>:8000"
+  },
+  "agent": {
+    "host": "127.0.0.1",
+    "port": 8100,
+    "auto_open_browser": true
+  }
+}
+```
+
+启动客服 Web 服务：
+
+```powershell
+python main.py agent
+```
+
+先打开管理员页面：
+
+```text
+http://127.0.0.1:8100/admin.html
+```
+
+使用第 1 步创建的管理员账号登录，然后完成两件事：
+
+1. 创建至少一个客服账号。
+2. 创建机器人条目，并保存页面只显示一次的 `Robot ID` 和 `Credential`。
+
+此时还没有启动机器人，所以机器人列表通常显示离线或待审批。
+
+### 第 3 步：部署 Linux 机器人端
+
+在机器人项目根目录创建 `config.json`，只配置共享控制地址和 `robot` 节：
+
+```json
+{
+  "cluster": {
+    "control_url": "http://<控制端Tailscale-IP>:8000"
+  },
+  "robot": {
+    "robot_id": "<管理员页面生成的 Robot ID>",
+    "credential": "<管理员页面生成的 Credential>",
+    "display_name": "<机器人名称>",
+    "sdk_root": "robot/vendor/AliRTCSDK_Linux-7.11.0",
+    "log_dir": "/tmp/artc-robot-logs",
+    "auto_start_session": true,
+    "exit_when_session_ends": true,
+    "audio_output": true,
+    "test_tone_frequency": null,
+    "camera_enabled": false
+  }
+}
+```
+
+机器人主机还需要：
+
+- 阿里云 ARTC Linux SDK，默认放在 `robot/vendor/AliRTCSDK_Linux-7.11.0`。
+- `parecord`，用于采集系统默认麦克风。
+- `ffplay`，用于把客服声音播放到系统默认扬声器。
+
+安装机器人 Python 依赖并启动：
+
+```bash
+conda activate rtc
+python -m pip install -r requirements-robot.txt
+chmod 600 config.json
+python main.py robot
+```
+
+如果管理员创建机器人后还没有审批，在 `/admin.html` 点击“通过”。机器人会自动登录、
+上报心跳、开始业务会话并加入自己的 ARTC 频道。
+
+### 第 4 步：客服接入并验收
+
+客服打开：
+
+```text
+http://127.0.0.1:8100/
+```
+
+使用管理员创建的客服账号登录。正常流程是：
+
+1. 客服看到机器人会话显示“等待客服接入”。
+2. 点击“开始处理”，会话变为“你正在处理”。
+3. 其他客服此时看到“其他客服处理中”，不能重复接入。
+4. 客服可以听取机器人声音。
+5. 需要向机器人说话时，点击“开始接管”，再点击“开启麦克风”。
+6. 机器人扬声器播放客服声音，同时机器人麦克风继续向当前客服回传。
+7. 点击“释放接管”关闭客服麦克风。
+8. 点击“离开会话”只释放占用，会话重新变为“等待客服接入”。
+9. 点击“结束会话”会结束整次业务，机器人停止媒体并退出进程。下一次外部呼叫重新
+   拉起机器人时，只验证数据库中已有的 Robot ID 和 Credential，不会重新注册。
+
+首次部署完成的最低验收标准：
+
+```text
+控制端健康检查通过
+机器人显示在线
+客服能看到“等待客服接入”
+第一名客服能独占接入
+第二名客服看到“其他客服处理中”
+客服能听到机器人
+机器人扬声器能听到客服
+双方说话时机器人麦克风和客服麦克风都未被另一方中断
+离开后会话恢复“等待客服接入”
+```
+
+## 日常启动入口
+
+控制端和机器人端运行在 Linux，要求 Python 3.10.x；客服 Web 服务可运行在当前客服
+电脑的 Windows 上：
+
+```text
+python main.py
+python main.py server
+python main.py robot
+python main.py agent
+```
+
+`python main.py agent` 会启动独立客服 Web 服务并打开页面。默认地址：
+
+```text
+http://127.0.0.1:8100/
+```
+
+直接运行 `python main.py` 会显示控制端、机器人端和 Web 客服工作台三个入口。首次
+部署建议直接使用本文上面的显式命令，避免选错组件。配置从固定位置自动加载，不需要
+在命令中传递 JSON 文件路径。
 
 ## 环境
 
-- Windows 10/11 x64。
-- Python 3.10.x，当前验证版本为 3.10.22。
-- 两台电脑位于同一局域网，均能访问 DingRTC 云端。
-- 客服电脑和呼叫电脑各自使用默认麦克风与扬声器。
-
-## 安装
-
-在项目根目录运行：
-
-```powershell
-.\setup.ps1
-```
-
-推荐先激活 Python 3.10 环境。也可以使用相对路径或环境变量指定解释器：
-
-```powershell
-$env:RTC_PYTHON = ".\runtime\python.exe"
-.\setup.ps1
-```
-
-`setup.ps1` 优先使用 `RTC_PYTHON`，否则使用 PATH 中的 `python` 或 Windows
-`py -3.10`。相对路径以项目根目录为基准。不会创建或启用已弃用的 `.venv`。
-
-依赖清单按运行形态拆分：
-
-| 文件 | 用途 |
-|---|---|
-| `requirements.txt` | Windows 全量开发环境 |
-| `requirements-server.txt` | 只运行 FastAPI 控制端，适合 Linux 云服务器 |
-| `requirements-caller.txt` | 呼叫端无 pip 依赖，仅作明确说明 |
-| `requirements-agent.txt` | PySide6 Windows 客服端 |
-
-安装完整环境或指定组件：
-
-```powershell
-.\setup.ps1
-.\setup.ps1 -Component server
-.\setup.ps1 -Component caller
-.\setup.ps1 -Component agent
-```
-
-Linux 云服务器只安装服务端依赖：
+- 控制端、机器人端：Linux x86_64。
+- 客服工作台：Windows 10/11 或 Linux，浏览器使用 Chrome/Edge。
+- Conda 环境 `rtc`，Python 3.10.x。
+- 阿里云 ARTC Linux SDK 7.11.0，放在被忽略的 `robot/vendor/`。
+- 机器人真实麦克风通过系统默认输入源和 `parecord` 采集，运行机需提供该命令。
+- 客服工作台不需要 npm 或前端构建；由 Python 标准库启动独立静态服务。
 
 ```bash
-python3.10 -m pip install -r requirements-server.txt
-python -X utf8 main.py server
-```
-
-呼叫端启动器只使用 Python 标准库；DingRTC 通过静态 `web/sdk.js` 加载，不需要
-pip 包。JavaScript 自动化测试需要 Node.js，但 Node.js 不是三种运行端的运行依赖。
-
-当前验证过的精确 Windows 全量依赖记录在 `requirements.lock.txt`。需要复现同一环境时运行：
-
-```powershell
-python -m pip install -r .\requirements.lock.txt
-```
-
-该锁文件包含 PySide6，只适用于当前 Windows 开发环境，不能直接作为 Linux 服务端锁文件。
-
-在已初始化 Conda 的 PowerShell 中激活统一环境：
-
-```powershell
 conda activate rtc
 python --version
 ```
 
-应显示 Python 3.10.22。如果当前 PowerShell 尚未初始化 Conda，可以设置
-`RTC_PYTHON` 或直接使用 PATH 中的 `python`。
+Windows 客服电脑只需安装 Python 3.10.x；Web 工作台使用标准库启动，不需要 PySide6
+或 npm。
 
-## 统一入口
+## 统一配置
 
-项目根目录的 `main.py` 提供三个运行模式。激活 `rtc` 环境后：
+项目只读取根目录 `config.json`。该文件包含 AppKey 和机器人设备凭证，已加入
+`.gitignore`，权限应为 `0600`。可提交模板为 `config.example.json`：
 
-```powershell
-# 集中后端
-python -X utf8 main.py server
-
-# PySide6 客服端
-python -X utf8 main.py agent
-
-# 本机呼叫页面
-python -X utf8 main.py caller
-
-# 首次部署，交互式创建唯一超级管理员
-python -X utf8 main.py server --create-admin
-
-# 超级管理员忘记密码时交互式重置
-python -X utf8 main.py server --reset-admin-password
-
-# Ctrl+C 无效时，从另一个终端停止本机后端
-python -X utf8 main.py server --stop
+```text
+cluster  共享控制端地址
+server   控制端
+agent    客服 Web 服务
+robot    机器人端
 ```
 
-只有 `--create-admin` 和 `--reset-admin-password` 会要求交互输入管理员密码。
-普通 `python -X utf8 main.py server` 启动不会创建管理员，也不会提示密码。
+从模板创建当前主机自己的 `config.json`：
 
-各模式还支持独立参数，例如：
-
-```powershell
-python -X utf8 main.py server --host 0.0.0.0 --port 8000
-python -X utf8 main.py caller --backend http://100.64.0.2:8000
-python -X utf8 main.py caller --port 8765
+```bash
+cp config.example.json config.json
+chmod 600 config.json
 ```
 
-## 配置
+Windows PowerShell：
 
-集中后端需要 DingRTC AppKey。不要把 AppKey 写入客户端，也不要写入受版本控制的
-`server/config.json`。后端脚本使用不进入版本控制的 `server/config.local.json`：
+```powershell
+Copy-Item config.example.json config.json
+```
+
+`config.json` 不应提交或分发给其他主机。每台主机可以只保留自己所需的节：
+控制端保留 `server`，Windows 客服端保留 `cluster + agent`，机器人端保留
+`cluster + robot`。只有一个文件是格式统一，不代表所有密钥要复制到所有机器。
+
+不再读取 `artc.local.json`、`agent/config.json`、`robot/config.json`、
+`*.config.local.json`，也不读取 `RTC_*`、`ARTC_*` 环境变量。
+
+机器人和客服共享 `cluster.control_url`，不再重复配置 `backend_url`。控制端默认
+`server.host` 为：
+
+```json
+"host": "0.0.0.0"
+```
+
+`0.0.0.0` 表示监听本机所有 IPv4 网卡。客户端仍必须通过控制端实际可达地址连接，
+例如 `cluster.control_url` 使用 Tailscale IP，不能填写 `0.0.0.0`。如果只希望
+监听 Tailscale，可将 `server.host` 改为 `tailscale`，启动时会解析并监听 Tailscale
+IPv4。
+
+## 组件详细说明
+
+以下内容用于配置核对和故障排查。首次部署仍以上面的第 1 至第 4 步为准。
+
+### 控制端说明
+
+安装服务端依赖并初始化管理员：
+
+```bash
+python -m pip install -r requirements-server.txt
+python main.py server --create-admin admin
+python main.py server
+```
+
+数据库文件和表结构会在首次启动时自动创建，但不会自动生成任何账号、场景或机器人。
+空数据库必须显式执行一次 `--create-admin`，并在隐藏提示中输入管理员密码。初始密码
+不会写入 `config.json` 或数据库明文。
+
+健康检查：
+
+```bash
+curl http://<控制端Tailscale-IP>:8000/api/health
+```
+
+控制端只从 `config.json` 的 `server` 节读取监听地址和端口，不再支持命令行
+`--host`、`--port`、`--db` 覆盖。
+
+### 机器人端说明
+
+管理员通过 `/admin.html` 或管理 API 创建并审批机器人。机器人参数统一写入根目录
+`config.json` 的
+`robot` 节：
 
 ```json
 {
-  "app_id": "cn4zs9jm",
-  "app_key": "your-app-key"
+  "robot": {
+    "robot_id": "<robot-id>",
+    "credential": "<设备凭证>",
+    "sdk_root": "robot/vendor/AliRTCSDK_Linux-7.11.0",
+    "log_dir": "/tmp/artc-robot-logs",
+    "audio_output": true
+  }
 }
 ```
 
-`server/config.local.json` 已由 `.gitignore` 排除。将 `your-app-key` 替换为真实
-AppKey 后，直接运行后端，不需要设置环境变量：
+机器人连接地址来自 `cluster.control_url`，不在 `robot` 节重复配置。
+`audio_output=true` 时机器人通过 `ffplay` 把客服语音播放到系统默认扬声器；
+未配置时也默认启用；`false` 仅统计远端音频并丢弃，用于没有扬声器的降级环境。
 
-```powershell
-python -X utf8 main.py server
+推荐先由管理员创建机器人并保存一次性返回的 `Robot ID + Credential`，再填入机器人
+配置。机器人登录后如果仍是待审批状态，会自动等待管理员处理。也可以在机器人配置中
+预先设置 `robot_id + credential` 后启动，机器人发现凭证尚不存在时会自动注册为待审批
+设备，管理员在 Windows 管理页审批后即可继续。
+
+启动：
+
+```bash
+python -m pip install -r requirements-robot.txt
+python main.py robot
 ```
 
-默认数据库是相对路径 `server/data/rtc.db`。配置中的 `db_path` 或环境变量
-`RTC_DB_PATH` 如果使用相对路径，统一相对于项目根目录解析，不受启动时当前目录影响。
+机器人会自动登录、上报心跳、连接 WebSocket、开始可见业务会话、获取短期 ARTC Token
+并加入独立频道。业务会话建立后机器人麦克风默认发布，客服是否听取不会改变该默认值。
+当前项目不包含机器人 TTS/自动对话；人工接管只设置
+`automaticSpeechPaused=true` 控制标记。外部业务语音模块如已接入，必须读取该标记并
+自行暂停，机器人麦克风和客服听取不受影响。
 
-`server/config.json` 只保存可直接进入版本控制的默认配置，其中 `app_key` 必须保持为空。
+`exit_when_session_ends=true` 时，客服结束业务会话后机器人进程自动退出。机器人身份、
+审批状态和历史会话仍在控制端数据库中，下次启动只需登录验证；只有记录不存在时才会
+进入自动注册流程。若由外部守护程序管理机器人生命周期，建议保持该值为 `true`。
 
-电脑 B 启动后端：
+若机器人提示“机器人凭证无效”，在**控制端 Linux 本机**运行只读诊断：
 
-```powershell
-python -X utf8 main.py server
+```bash
+python -m tools.diagnose_robot_auth
 ```
 
-后端监听 `0.0.0.0:8000`。在电脑 B 上以管理员 PowerShell 执行以下命令，
-仅允许专用网络访问该端口：
+控制端 `config.json` 没有 `robot` 节时，可只传机器人 ID：
 
-```powershell
-New-NetFirewallRule -DisplayName "RTC Backend 8000" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow -Profile Private
+```bash
+python -m tools.diagnose_robot_auth --robot-id '<robot-id>'
 ```
 
-不需要把该端口暴露到公网，也不要为当前原型开放公用网络配置文件。
+需要核对旧进程使用的其他数据库时，可只读指定文件：
 
-## 两台电脑运行
+```bash
+python -m tools.diagnose_robot_auth --db /tmp/artc-integration.db
+```
 
-电脑 B 修改 `agent/config.json`：
+`--db` 只用于诊断，不会改变项目配置或控制端启动时使用的数据库。
+
+`robotExists=false` 表示控制端当前数据库没有该机器人；`robotExists=true` 且审批/启用
+正常时，401 表示本地保存的凭证与服务端哈希不一致，需要重新轮换设备凭证并同步到
+机器人配置。
+
+该诊断命令会读取服务端数据库，不能在机器人端或 Windows 客服电脑上运行。机器人端
+只通过 HTTP/WebSocket 访问控制端，不需要 SQLite。
+
+### 客服端说明
+
+管理员创建客服账号后（系统自动使用默认场景），客服启动独立工作台：
+
+```bash
+python main.py agent
+```
+
+- 客服页面：`http://127.0.0.1:8100/`
+- 管理页面：`http://127.0.0.1:8100/admin.html`
+
+管理页面支持机器人创建/查询/改名/删除/审批/启停/凭证轮换、客服创建/启停和审计记录。业务场景作为
+内部兼容字段隐藏，不再要求管理员操作。管理员登录后使用同一控制端 API，普通客服
+账号不能进入管理页面。
+机器人删除会立即结束活动会话、注销设备凭证并从机器人目录隐藏；历史会话和审计仍保留。
+
+客服 Web 配置位于根目录 `config.json` 的 `agent` 节。Windows 客服工作台监听本机
+`127.0.0.1:8100`，连接地址来自 `cluster.control_url`：
 
 ```json
 {
-  "backend_url": "http://127.0.0.1:8000"
+  "cluster": {
+    "control_url": "http://<控制端Tailscale-IP>:8000"
+  },
+  "agent": {
+    "host": "127.0.0.1",
+    "port": 8100,
+    "auto_open_browser": true
+  }
 }
 ```
 
-然后运行：
+浏览器和客服 Web 服务在同一台 Windows 电脑时，访问 `http://127.0.0.1:8100/`
+属于浏览器可信的安全上下文，可以正常申请麦克风权限。客服页面来源是 localhost，
+因此控制端现有 CORS 规则默认允许；机器人访问控制端不涉及浏览器 CORS。
 
-```powershell
-python -X utf8 main.py agent
+Tailscale 部署时：
+
+1. 控制端和机器人端 Linux 加入同一 tailnet。
+2. Windows 客服电脑安装并登录 Tailscale。
+3. 控制端 `server.host` 使用 `0.0.0.0`，通过 Tailscale IP 和防火墙限制访问。
+4. `cluster.control_url` 使用控制端 Tailscale IP。
+5. Windows 浏览器只访问本机 `127.0.0.1:8100`，不需要让 Windows 监听外部网卡。
+
+在控制端本机可创建默认客服账号：
+
+```bash
+python -m tools.create_default_agent
 ```
 
-电脑 A 修改 `caller/config.json`，将 `backend_url` 改为电脑 B 的局域网地址，例如：
+该命令要求已经存在管理员，会自动创建或复用隐藏的默认场景，创建 `agent01`，随机
+生成密码并只输出一次。数据库只保存密码哈希。
 
-```json
-{
-  "backend_url": "http://192.168.1.20:8000",
-  "default_name": "呼叫客户端 A",
-  "port": 8765
-}
+工作台支持：
+
+- 查看有权限的业务会话状态：等待接入、正在处理、客服通话中或机器人离线。
+- 客服接入会话前由后端原子认领；一个会话只允许一名客服接入，一个客服同时只占一个会话。
+- 使用 ARTC Web SDK 接收机器人音频和可选摄像头画面。
+- 申请、续租、释放人工接管租约。
+- 默认关闭客服麦克风和摄像头，接管成功后按需发布客服麦克风。
+- 左侧会话卡片显示“客服通话中/客服已接管”和“麦克风已开/麦克风关闭”。
+- 机器人麦克风在活动业务会话中默认发布，客服端麦克风默认关闭。
+- 离开或控制面断线时立即关闭本地麦克风，并释放会话认领、租约和监听。
+- 短期 ARTC Token 到期前自动向业务后端刷新。
+
+访问 Token 和 ARTC Token 只保存在页面内存，不写入 `localStorage`、Cookie 或 URL。
+浏览器客服的 `userId` 由后端生成为 `agent-<客服业务 id>`。
+
+ARTC Web SDK 固定为 `7.3.4`，文件 SHA-256：
+
+```text
+46b57790f4539150f45c6ab3f113e9ed0b73e756fd3c97a0d6813c99628ba6d1
 ```
 
-`installation_uuid` 和审批后的设备凭证由启动器自动写入不进入版本控制的
-`caller/config.local.json`。不要在配置中手工填写可冒充其他客户端的编号。
-`caller/config.json` 的 `default_name` 非空时作为固定客户端名称；为空时会自动
-生成 `CALL-XXXXXXXX` 并保存到 `config.local.json`，后续启动保持不变。呼叫页面
-只展示客户端名称，超级管理员可以在客户端管理页面改名。
-客户端被拒绝或停用后，页面会显示“重新注册”，原客户端记录重新进入待审批，
-管理员仍需再次批准。
+## 测试
 
-如果页面提示“客户端设备凭证无效”，说明本机凭证与后端保存的凭证哈希已经不匹配。
-此时“重新注册”会生成新的 `installation_uuid`、清除本机旧凭证并提交一个新的待审批
-客户端记录。若希望沿用原客户端编号，应由管理员在“客户端审批”中点击“重置凭证”，
-然后刷新呼叫页面。不同呼叫设备不能共用同一份 `config.local.json`。
-两台客户端必须使用不同的 `installation_uuid`；否则并发呼叫会复用同一个会话，
-导致两个呼叫端进入同一 RTC 房间并出现异常。
-
-然后运行：
-
-```powershell
-python -X utf8 main.py caller
-```
-
-呼叫页面固定从电脑 A 的 `127.0.0.1:8765` 加载，才能可靠保存 Origin、浏览器权限
-和客户端身份。页面再连接电脑 B 的集中后端。
-
-两台电脑按以下顺序启动：
-
-1. 电脑 B 首次部署时执行 `server --create-admin`，再启动后端。
-2. 电脑 B 启动客服端，用超级管理员登录并审批客户端。
-3. 电脑 B 用客服账号登录，查看空闲和占用客户端。
-4. 电脑 A 启动呼叫页面，等待管理员批准后发起呼叫。
-
-## 开发账号
-
-首次启动后端时会在 SQLite 中创建两个开发账号：
-
-- `agent01` / `agent123`
-- `agent02` / `agent123`
-
-账密只适合局域网原型。公网部署前必须修改预置账号和密码，并启用 HTTPS/WSS。
-超级管理员不会预置，必须通过服务器命令创建。
-
-## 验证流程
-
-1. 超级管理员登录管理界面，批准待审批客户端。
-2. 电脑 B 启动两个客服实例，分别登录两个客服账号。
-3. 两个客服端应在客户端目录看到同一批已批准客户端及空闲/占用状态。
-4. 电脑 A 点击“发起呼叫”；空闲客服端应出现新呼叫提示、提示音和“接听”按钮，
-   呼叫端在客服点击接听前保持“排队中”。
-5. 两个客服都在通话时，再发起呼叫，呼叫端应显示“排队中”和当前排队位置。
-6. 任一客服挂断后，队列首位呼叫应提示空闲客服，由客服点击“接听”后进入 RTC。
-7. 双方检查默认麦克风和扬声器能否双向听到声音。
-8. 呼叫端点击“共享屏幕”，客服端应看到呼叫端选择的屏幕画面。
-9. 任意一方主动挂断后，呼叫页面和客服端都应结束当前通话并退出 RTC。
-10. 管理员停用客服或客户端后，其旧登录和旧设备凭证应立即失效。
-
-## 自动测试
-
-```powershell
+```bash
 python -m unittest discover -s tests -v
+python -m compileall -q server robot agent tools tests
+python -m tools.secret_scan
 ```
 
-自动测试不访问 DingRTC 云端。真实双向音频和屏幕共享必须在两台电脑上人工验收。
+自动化测试不访问真实 ARTC 云。真实跨 SDK 验收需要同时运行 Linux 机器人和控制端，
+再启动独立 `agent` Web 服务，在浏览器中验证机器人音频、人工接管、客服麦克风、可选
+摄像头、断线重连和 Token 刷新。
 
-当前自动化结果：
+## 当前限制
 
-- 完整自动化测试 `50/50` 通过。
-- Python 代码通过 `compileall` 语法检查。
-- 呼叫端和客服端 JavaScript 通过 `node --check` 语法检查。
-- 真实桌面麦克风权限、真实 DingRTC 入会和双向音频尚未在当前环境验收。
+- “Linux 机器人 + Web 客服”跨 SDK 真实媒体闭环尚未在本轮验收。
+- 物理客服麦克风、机器人扬声器听感、可选摄像头和长时间运行仍需真实设备验证。
+- 公网部署仍需 HTTPS/WSS、域名、证书、限流和账号安全配置。
 
-## 安全边界
-
-当前版本仅用于可信局域网原型，不支持公网部署。公网使用前必须完成：
-
-- 使用 HTTPS 和 WSS，并配置域名与有效证书。
-- 修改开发账号、密码和密钥管理方式，增加登录保护与限流。
-- 停用管理员、客服或客户端时必须吊销现有凭证。
-- 限制后端监听范围、防火墙来源和反向代理配置。
-- 对日志、数据库、配置和备份执行秘密信息审计。
-
-## 当前边界
-
-当前实现双向音频、呼叫端向客服端共享屏幕、客户端注册审批、超级管理员、客服账号管理、客户端目录、占用同步、接听冲突和挂断。未实现摄像头视频、在线心跳、真实机器人、Electron、控制流、公网 TLS 部署、媒体录制和复杂后台权限。
+接口和数据模型见 [docs/artc-architecture.md](docs/artc-architecture.md)，验收状态见
+[docs/acceptance.md](docs/acceptance.md)，机器人 PoC 见
+[docs/artc-poc.md](docs/artc-poc.md)，ARTC 频道、统计和记录边界见
+[docs/artc-cloud-capabilities.md](docs/artc-cloud-capabilities.md)。
