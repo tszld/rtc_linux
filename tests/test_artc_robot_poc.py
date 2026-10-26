@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from robot.artc_poc.audio import NullPcmOutput, PcmFrame
+from robot.artc_poc.audio import NullPcmOutput, PcmFrame, apply_pcm_gain
 from robot.artc_poc.main import (
     read_token,
     set_microphone_enabled,
@@ -131,6 +131,20 @@ class RobotPoCSessionTests(unittest.TestCase):
         session.on_remote_audio(PcmFrame(b"\x18\xfc\xd0\x07", 48000, 1, 16))
 
         self.assertEqual(session.remote_audio_peak, 2000)
+
+    def test_remote_playback_volume_applies_pcm_gain(self) -> None:
+        pcm = b"\xe8\x03\x18\xfc"
+
+        self.assertEqual(apply_pcm_gain(pcm, 100), pcm)
+        self.assertEqual(
+            apply_pcm_gain(pcm, 50),
+            b"\xf4\x01\x0c\xfe",
+        )
+        self.assertEqual(apply_pcm_gain(pcm, 0), b"\x00\x00\x00\x00")
+
+        session, _, output = self.make_session()
+        session.set_remote_playback_volume(35)
+        self.assertEqual(output.volume, 35)
 
     def test_close_stops_microphone_leaves_and_releases(self) -> None:
         session, engine, _ = self.make_session()

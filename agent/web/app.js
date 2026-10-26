@@ -1,4 +1,5 @@
 import { AgentRtcSession } from "./rtc.js";
+import { NativeAudioSession } from "./native-audio.js";
 
 
 const ROBOT_STATUS_LABELS = {
@@ -11,6 +12,9 @@ const LEASE_SECONDS = 60;
 const RECONNECT_DELAY_MS = 2000;
 const PING_INTERVAL_MS = 15000;
 const CATALOG_REFRESH_MS = 4000;
+const NATIVE_HEARTBEAT_MS = 5000;
+const VOLUME_UPDATE_DELAY_MS = 180;
+const COMBO_VOICE_UPDATE_DELAY_MS = 240;
 
 
 class ApiError extends Error {
@@ -53,13 +57,31 @@ const elements = {
   robotCameraState: document.querySelector("#robotCameraState"),
   listenState: document.querySelector("#listenState"),
   microphoneState: document.querySelector("#microphoneState"),
+  voiceState: document.querySelector("#voiceState"),
   leaseTitle: document.querySelector("#leaseTitle"),
-  leaseTimer: document.querySelector("#leaseTimer"),
   leaseDescription: document.querySelector("#leaseDescription"),
   microphoneTitle: document.querySelector("#microphoneTitle"),
   microphoneDescription: document.querySelector("#microphoneDescription"),
   microphoneIndicator: document.querySelector("#microphoneIndicator"),
   microphoneButton: document.querySelector("#microphoneButton"),
+  voiceMode: document.querySelector("#voiceMode"),
+  comboVoicePanel: document.querySelector("#comboVoicePanel"),
+  comboBaseVoice: document.querySelector("#comboBaseVoice"),
+  comboPitch: document.querySelector("#comboPitch"),
+  comboPitchValue: document.querySelector("#comboPitchValue"),
+  comboReverb: document.querySelector("#comboReverb"),
+  comboBeautify: document.querySelector("#comboBeautify"),
+  comboLowGain: document.querySelector("#comboLowGain"),
+  comboLowGainValue: document.querySelector("#comboLowGainValue"),
+  comboMidGain: document.querySelector("#comboMidGain"),
+  comboMidGainValue: document.querySelector("#comboMidGainValue"),
+  comboHighGain: document.querySelector("#comboHighGain"),
+  comboHighGainValue: document.querySelector("#comboHighGainValue"),
+  robotAudioVolume: document.querySelector("#robotAudioVolume"),
+  robotAudioVolumeValue: document.querySelector("#robotAudioVolumeValue"),
+  agentPlaybackVolume: document.querySelector("#agentPlaybackVolume"),
+  agentPlaybackVolumeValue: document.querySelector("#agentPlaybackVolumeValue"),
+  agentPlaybackVolumeState: document.querySelector("#agentPlaybackVolumeState"),
   takeoverButton: document.querySelector("#takeoverButton"),
   releaseButton: document.querySelector("#releaseButton"),
   joinButton: document.querySelector("#joinButton"),
@@ -73,6 +95,8 @@ const elements = {
 const state = {
   backendUrl: "",
   configReady: false,
+  nativeAudioAvailable: false,
+  agentControlToken: "",
   accessToken: "",
   principal: null,
   sessions: [],
@@ -84,6 +108,30 @@ const state = {
   leaseUncertain: false,
   microphoneEnabled: false,
   rtc: null,
+  nativeAudio: null,
+  talkUserId: null,
+  ignoredMediaUserIds: new Set(),
+  talkAuth: null,
+  voiceMode: 0,
+  voiceModeLabels: { 0: "关闭音色改变" },
+  comboVoiceDefaults: {
+    baseVoiceMode: 3,
+    pitch: 1.1,
+    reverbMode: 1,
+    beautifyMode: 2,
+    lowGain: -1,
+    midGain: 2,
+    highGain: 3,
+  },
+  comboVoice: null,
+  comboVoiceLabels: { reverb: {}, beautify: {} },
+  robotAudioVolume: 100,
+  agentPlaybackVolume: 100,
+  robotMediaUserId: null,
+  playbackVolumeTimer: null,
+  comboVoiceTimer: null,
+  nativeHeartbeatTimer: null,
+  talkTokenRefreshTimer: null,
   socket: null,
   socketReconnectTimer: null,
   socketPingTimer: null,
@@ -245,6 +293,282 @@ function errorText(error) {
     return error.message;
   }
   return String(error || "操作失败");
+}
+
+
+function voiceModeLabel(mode) {
+  return state.voiceModeLabels[Number(mode)] || `模式 ${mode}`;
+}
+
+
+function updateComboVoiceOutputs() {
+  const voice = state.comboVoice || state.comboVoiceDefaults;
+  elements.comboPitchValue.textContent = Number(voice.pitch).toFixed(2);
+  elements.comboLowGainValue.textContent = `${Number(voice.lowGain).toFixed(0)} dB`;
+  elements.comboMidGainValue.textContent = `${Number(voice.midGain).toFixed(0)} dB`;
+  elements.comboHighGainValue.textContent = `${Number(voice.highGain).toFixed(0)} dB`;
+}
+
+
+function setComboVoiceControls(voice) {
+  state.comboVoice = { ...voice };
+  elements.comboBaseVoice.value = String(voice.baseVoiceMode);
+  elements.comboPitch.value = String(voice.pitch);
+  elements.comboReverb.value = String(voice.reverbMode);
+  elements.comboBeautify.value = String(voice.beautifyMode);
+  elements.comboLowGain.value = String(voice.lowGain);
+  elements.comboMidGain.value = String(voice.midGain);
+  elements.comboHighGain.value = String(voice.highGain);
+  updateComboVoiceOutputs();
+}
+
+
+function readComboVoiceControls() {
+  return {
+    baseVoiceMode: Number(elements.comboBaseVoice.value),
+    pitch: Number(elements.comboPitch.value),
+    reverbMode: Number(elements.comboReverb.value),
+    beautifyMode: Number(elements.comboBeautify.value),
+    lowGain: Number(elements.comboLowGain.value),
+    midGain: Number(elements.comboMidGain.value),
+    highGain: Number(elements.comboHighGain.value),
+  };
+}
+
+
+function scheduleComboVoiceApply() {
+  window.clearTimeout(state.comboVoiceTimer);
+  state.comboVoiceTimer = window.setTimeout(() => {
+    state.comboVoiceTimer = null;
+    if (!state.nativeAudio?.sessionId || state.voiceMode !== 100) {
+      return;
+    }
+    void state.nativeAudio
+      .setVoiceMode(100, state.comboVoice)
+      .catch((error) => {
+        showToast(`组合音色应用失败：${errorText(error)}`, "danger");
+      });
+  }, COMBO_VOICE_UPDATE_DELAY_MS);
+}
+
+
+function handleComboVoiceInput() {
+  state.comboVoice = readComboVoiceControls();
+  state.voiceMode = 100;
+  elements.voiceMode.value = "100";
+  updateComboVoiceOutputs();
+  render();
+  scheduleComboVoiceApply();
+}
+
+
+function applyRobotAudioVolume() {
+  if (!state.robotMediaUserId) {
+    return;
+  }
+  state.rtc?.setRemoteAudioVolume(
+    state.robotMediaUserId,
+    state.robotAudioVolume,
+  );
+}
+
+
+function updateRobotAudioVolume(value) {
+  state.robotAudioVolume = Math.max(0, Math.min(100, Number(value)));
+  elements.robotAudioVolumeValue.textContent = `${state.robotAudioVolume}%`;
+  elements.robotAudioVolume.value = String(state.robotAudioVolume);
+  applyRobotAudioVolume();
+}
+
+
+function scheduleAgentPlaybackVolumeUpdate() {
+  window.clearTimeout(state.playbackVolumeTimer);
+  state.playbackVolumeTimer = window.setTimeout(() => {
+    state.playbackVolumeTimer = null;
+    void sendAgentPlaybackVolume();
+  }, VOLUME_UPDATE_DELAY_MS);
+}
+
+
+async function sendAgentPlaybackVolume() {
+  const sessionId = state.joinedSessionId;
+  if (!sessionId) {
+    return;
+  }
+  elements.agentPlaybackVolumeState.textContent = "正在下发机器人播放音量...";
+  try {
+    const result = await apiRequest(
+      `/api/robot-sessions/${encodeURIComponent(sessionId)}/agent-playback-volume`,
+      {
+        method: "POST",
+        body: { volume: state.agentPlaybackVolume },
+      },
+    );
+    elements.agentPlaybackVolumeState.textContent = result.delivered
+      ? `机器人播放音量已设置为 ${state.agentPlaybackVolume}%。`
+      : "机器人控制连接未送达，等待机器人重新连接后再调整。";
+  } catch (error) {
+    elements.agentPlaybackVolumeState.textContent = `机器人播放音量设置失败：${errorText(error)}`;
+  }
+}
+
+
+function updateAgentPlaybackVolume(value) {
+  state.agentPlaybackVolume = Math.max(0, Math.min(100, Number(value)));
+  elements.agentPlaybackVolumeValue.textContent = `${state.agentPlaybackVolume}%`;
+  elements.agentPlaybackVolume.value = String(state.agentPlaybackVolume);
+  scheduleAgentPlaybackVolumeUpdate();
+}
+
+
+function requireNativeAudio() {
+  if (!state.nativeAudioAvailable || !state.agentControlToken) {
+    throw new Error("Windows ARTC 音频助手未就绪");
+  }
+  if (!state.nativeAudio) {
+    state.nativeAudio = new NativeAudioSession({
+      controlToken: state.agentControlToken,
+      onEvent: handleNativeAudioEvent,
+    });
+  }
+  return state.nativeAudio;
+}
+
+
+function startNativeHeartbeat() {
+  window.clearInterval(state.nativeHeartbeatTimer);
+  state.nativeHeartbeatTimer = window.setInterval(() => {
+    if (!state.nativeAudio?.sessionId) {
+      return;
+    }
+    void state.nativeAudio.heartbeat().catch((error) => {
+      void stopNativeAudio();
+      showToast(`Windows 音频连接已停止：${errorText(error)}`, "danger");
+    });
+  }, NATIVE_HEARTBEAT_MS);
+}
+
+
+function stopNativeHeartbeat() {
+  window.clearInterval(state.nativeHeartbeatTimer);
+  state.nativeHeartbeatTimer = null;
+}
+
+
+function scheduleTalkTokenRefresh(auth) {
+  window.clearTimeout(state.talkTokenRefreshTimer);
+  const expiresAt = Number(auth?.expiresAt || 0) * 1000;
+  const delay = Number.isFinite(expiresAt) && expiresAt > 0
+    ? Math.max(5000, expiresAt - Date.now() - 60000)
+    : 30000;
+  state.talkTokenRefreshTimer = window.setTimeout(() => {
+    void refreshTalkToken();
+  }, delay);
+}
+
+
+async function refreshTalkToken() {
+  if (!state.lease?.sessionId || !state.nativeAudio?.sessionId) {
+    return;
+  }
+  const sessionId = state.lease.sessionId;
+  try {
+    const auth = await apiRequest(
+      `/api/robot-sessions/${encodeURIComponent(sessionId)}/talk-token`,
+      { method: "POST", body: {} },
+    );
+    if (state.lease?.sessionId !== sessionId || !state.nativeAudio?.sessionId) {
+      return;
+    }
+    await state.nativeAudio.refreshToken(auth.token);
+    state.talkAuth = auth;
+    scheduleTalkTokenRefresh(auth);
+  } catch (error) {
+    await stopNativeAudio();
+    showToast(`麦克风凭证刷新失败：${errorText(error)}`, "danger");
+  }
+}
+
+
+async function startNativeAudioForLease(sessionId) {
+  const auth = await apiRequest(
+    `/api/robot-sessions/${encodeURIComponent(sessionId)}/talk-token`,
+    { method: "POST", body: {} },
+  );
+  const nativeAudio = requireNativeAudio();
+  const status = await nativeAudio.start(
+    auth,
+    state.voiceMode,
+    state.voiceMode === 100 ? state.comboVoice : null,
+  );
+  state.talkAuth = auth;
+  state.talkUserId = status.userId || auth.userId;
+  state.ignoredMediaUserIds.add(state.talkUserId);
+  state.rtc?.muteRemoteAudio(state.talkUserId, true);
+  scheduleTalkTokenRefresh(auth);
+  startNativeHeartbeat();
+}
+
+
+async function stopNativeAudio({ keepalive = false } = {}) {
+  stopNativeHeartbeat();
+  window.clearTimeout(state.talkTokenRefreshTimer);
+  window.clearTimeout(state.playbackVolumeTimer);
+  window.clearTimeout(state.comboVoiceTimer);
+  state.talkTokenRefreshTimer = null;
+  const nativeAudio = state.nativeAudio;
+  if (!nativeAudio?.sessionId) {
+    state.microphoneEnabled = false;
+    state.talkAuth = null;
+    state.talkUserId = null;
+    return;
+  }
+  const sessionId = state.lease?.sessionId;
+  const shouldReportMicrophone = Boolean(
+    state.microphoneEnabled || nativeAudio.microphoneEnabled,
+  );
+  try {
+    if (nativeAudio.microphoneEnabled) {
+      await nativeAudio.setMicrophone(false);
+    }
+  } catch (_error) {
+    // 助手异常时仍继续请求进程退出。
+  }
+  try {
+    await nativeAudio.stop({ keepalive });
+  } catch (_error) {
+    // 页面退出或助手已经退出时不再阻塞后续控制面清理。
+  }
+  if (shouldReportMicrophone && sessionId) {
+    await apiRequest(
+      `/api/robot-sessions/${encodeURIComponent(sessionId)}/takeover-lease/microphone`,
+      { method: "POST", body: { enabled: false } },
+    ).catch(() => {});
+  }
+  state.microphoneEnabled = false;
+  state.talkAuth = null;
+  state.talkUserId = null;
+}
+
+
+function handleNativeAudioEvent(event) {
+  switch (event.type) {
+    case "connected":
+      elements.voiceState.textContent = voiceModeLabel(event.voiceMode);
+      break;
+    case "microphone":
+      state.microphoneEnabled = Boolean(event.enabled);
+      render();
+      break;
+    case "voice":
+      state.voiceMode = Number(event.mode);
+      elements.voiceState.textContent = voiceModeLabel(state.voiceMode);
+      break;
+    case "token-refreshed":
+      break;
+    default:
+      break;
+  }
 }
 
 
@@ -605,6 +929,8 @@ function renderSessionWorkspace() {
   elements.listenState.textContent = isJoined && state.listening ? "听取中" : "未接入";
   elements.microphoneState.textContent = state.microphoneEnabled ? "发布中" : "关闭";
   elements.microphoneState.classList.toggle("active", state.microphoneEnabled);
+  elements.voiceState.textContent = voiceModeLabel(state.voiceMode);
+  elements.voiceMode.value = String(state.voiceMode);
 
   elements.joinButton.hidden = false;
   elements.joinButton.disabled = isJoined || claimOwnedByOther;
@@ -623,13 +949,36 @@ function renderSessionWorkspace() {
     || !claimOwnedByMe
     || Boolean(session.takeover)
     || Boolean(state.lease)
+    || !state.nativeAudioAvailable
   );
   elements.releaseButton.disabled = !ownLease || state.leaseUncertain;
   elements.microphoneButton.disabled = (
     !ownLease
     || state.leaseUncertain
     || leaseRemainingSeconds() <= 0
+    || !state.nativeAudioAvailable
   );
+  elements.voiceMode.disabled = (
+    !isJoined
+    || !state.nativeAudioAvailable
+  );
+  const comboControlsEnabled = isJoined && state.nativeAudioAvailable;
+  elements.comboVoicePanel.hidden = state.voiceMode !== 100;
+  for (const control of [
+    elements.comboBaseVoice,
+    elements.comboPitch,
+    elements.comboReverb,
+    elements.comboBeautify,
+    elements.comboLowGain,
+    elements.comboMidGain,
+    elements.comboHighGain,
+  ]) {
+    control.disabled = !comboControlsEnabled;
+  }
+  elements.robotAudioVolume.disabled = !isJoined;
+  elements.agentPlaybackVolume.disabled = !isJoined;
+  elements.robotAudioVolumeValue.textContent = `${state.robotAudioVolume}%`;
+  elements.agentPlaybackVolumeValue.textContent = `${state.agentPlaybackVolume}%`;
   elements.microphoneButton.textContent = state.microphoneEnabled ? "关闭麦克风" : "开启麦克风";
 
   if (state.leaseUncertain && ownLease) {
@@ -642,8 +991,8 @@ function renderSessionWorkspace() {
     elements.leaseDescription.textContent = "人工接管已生效，客服麦克风仍需手动开启。";
     elements.microphoneTitle.textContent = state.microphoneEnabled ? "正在发布" : "等待开启";
     elements.microphoneDescription.textContent = state.microphoneEnabled
-      ? "客服麦克风正在向当前频道发布。"
-      : "接管租约有效，客服麦克风保持关闭。";
+      ? `客服麦克风正在使用“${voiceModeLabel(state.voiceMode)}”效果发布。`
+      : "接管租约有效，Windows 原生客服麦克风保持关闭。";
   } else if (foreignLease) {
     elements.leaseTitle.textContent = `${session.takeover.agentDisplayName} 接管中`;
     elements.leaseDescription.textContent = "当前客服可以查看和听取，但不能发布客服麦克风。";
@@ -656,24 +1005,23 @@ function renderSessionWorkspace() {
     elements.microphoneDescription.textContent = "请在其他页面释放接管后再继续。";
   } else {
     elements.leaseTitle.textContent = "未接管";
-    elements.leaseDescription.textContent = "当前会话尚未由人工接管。";
+    elements.leaseDescription.textContent = state.nativeAudioAvailable
+      ? "当前会话尚未由人工接管。"
+      : "Windows ARTC 音频助手未就绪，不能开启客服麦克风。";
     elements.microphoneTitle.textContent = "默认关闭";
     elements.microphoneDescription.textContent = "尚未取得人工接管租约。";
   }
 
   elements.microphoneIndicator.dataset.active = String(state.microphoneEnabled);
-  renderLeaseTimer();
+  renderLeaseState();
 }
 
 
-function renderLeaseTimer() {
+function renderLeaseState() {
   if (!state.lease || state.leaseUncertain) {
-    elements.leaseTimer.textContent = "--";
     return;
   }
-  const seconds = leaseRemainingSeconds();
-  elements.leaseTimer.textContent = `${seconds}s`;
-  if (seconds <= 0) {
+  if (leaseRemainingSeconds() <= 0) {
     elements.microphoneButton.disabled = true;
     elements.microphoneButton.textContent = "租约已过期";
   }
@@ -704,6 +1052,8 @@ async function joinSelectedSession() {
   elements.joinButton.disabled = true;
   elements.joinButton.textContent = "接入中";
   elements.rtcState.textContent = "正在申请媒体权限";
+  state.ignoredMediaUserIds.clear();
+  state.robotMediaUserId = `robot-${session.robotId}`;
 
   let claimAcquired = false;
   try {
@@ -726,6 +1076,8 @@ async function joinSelectedSession() {
     state.joinedSessionId = session.id;
 
     await setListening(true);
+    applyRobotAudioVolume();
+    await sendAgentPlaybackVolume();
     elements.rtcState.textContent = "媒体已连接";
     elements.audioState.textContent = "等待机器人音频";
     showToast("已接入业务会话", "success");
@@ -740,6 +1092,9 @@ async function joinSelectedSession() {
     state.rtc = null;
     state.joinedSessionId = null;
     state.listening = false;
+    state.microphoneEnabled = false;
+    state.ignoredMediaUserIds.clear();
+    state.robotMediaUserId = null;
     elements.rtcState.textContent = "媒体接入失败";
     elements.audioState.textContent = "机器人音频不可用";
     showToast(errorText(error), "danger");
@@ -788,12 +1143,25 @@ async function acquireTakeover() {
     state.lease = lease;
     state.leaseUncertain = false;
     updateTakeover(session.id, lease);
+    await startNativeAudioForLease(session.id);
     scheduleLeaseRenewal();
     showToast("人工接管已开始，客服麦克风仍保持关闭", "success");
     render();
   } catch (error) {
+    await stopNativeAudio();
+    if (state.lease?.sessionId === session.id) {
+      await apiRequest(
+        `/api/robot-sessions/${encodeURIComponent(session.id)}/takeover-lease/release`,
+        { method: "POST", body: {} },
+      ).catch(() => {});
+      state.lease = null;
+      state.leaseUncertain = false;
+      window.clearTimeout(state.leaseRenewTimer);
+      updateTakeover(session.id, null);
+    }
     showToast(errorText(error), "danger");
     await refreshCatalog({ silent: true });
+    render();
   }
 }
 
@@ -861,21 +1229,51 @@ async function toggleMicrophone() {
     showToast("没有有效的接管租约", "danger");
     return;
   }
-  if (!state.rtc) {
-    showToast("媒体会话未接入", "danger");
+  if (!state.rtc || !state.nativeAudioAvailable) {
+    showToast("Windows ARTC 音频助手未就绪", "danger");
     return;
   }
 
   const target = !state.microphoneEnabled;
   elements.microphoneButton.disabled = true;
   try {
-    await state.rtc.setMicrophone(target);
+    if (!state.nativeAudio?.sessionId) {
+      await startNativeAudioForLease(state.lease.sessionId);
+    }
+    const nativeAudio = requireNativeAudio();
+    await nativeAudio.setMicrophone(target);
     await reportTakeoverMicrophone(target);
     state.microphoneEnabled = target;
     render();
   } catch (error) {
     state.microphoneEnabled = false;
-    await state.rtc.setMicrophone(false).catch(() => {});
+    await state.nativeAudio?.setMicrophone(false).catch(() => {});
+    showToast(errorText(error), "danger");
+    render();
+  }
+}
+
+
+async function changeVoiceMode() {
+  const nextMode = Number(elements.voiceMode.value);
+  if (!(nextMode in state.voiceModeLabels)) {
+    return;
+  }
+  const previousMode = state.voiceMode;
+  state.voiceMode = nextMode;
+  render();
+  if (!state.nativeAudio?.sessionId) {
+    return;
+  }
+  try {
+    await state.nativeAudio.setVoiceMode(
+      nextMode,
+      nextMode === 100 ? state.comboVoice : null,
+    );
+    showToast(`音色改变已切换为“${voiceModeLabel(nextMode)}”`, "success");
+  } catch (error) {
+    state.voiceMode = previousMode;
+    elements.voiceMode.value = String(previousMode);
     showToast(errorText(error), "danger");
     render();
   }
@@ -888,6 +1286,7 @@ async function releaseTakeover({ silent = false } = {}) {
   }
   const sessionId = state.lease.sessionId;
   await stopLocalMicrophone();
+  await stopNativeAudio();
   try {
     await apiRequest(
       `/api/robot-sessions/${encodeURIComponent(sessionId)}/takeover-lease/release`,
@@ -918,6 +1317,7 @@ async function releaseTakeover({ silent = false } = {}) {
 
 async function stopLocalTakeover(reason) {
   await stopLocalMicrophone();
+  await stopNativeAudio();
   state.lease = null;
   state.leaseUncertain = false;
   window.clearTimeout(state.leaseRenewTimer);
@@ -929,9 +1329,9 @@ async function stopLocalTakeover(reason) {
 
 
 async function stopLocalMicrophone() {
-  if (state.rtc && state.microphoneEnabled) {
+  if (state.nativeAudio?.sessionId && state.microphoneEnabled) {
     try {
-      await state.rtc.setMicrophone(false);
+      await state.nativeAudio.setMicrophone(false);
     } catch (_error) {
       // 离会或网络断开时仍继续清理本地可见状态。
     }
@@ -963,6 +1363,7 @@ async function leaveSession({
     if (shouldRelease && state.lease) {
       await releaseTakeover({ silent: true });
     } else {
+      await stopNativeAudio();
       state.lease = null;
       state.leaseUncertain = false;
       window.clearTimeout(state.leaseRenewTimer);
@@ -996,6 +1397,8 @@ async function leaveSession({
     state.joinedSessionId = null;
     state.listening = false;
     state.microphoneEnabled = false;
+    state.ignoredMediaUserIds.clear();
+    state.robotMediaUserId = null;
     elements.rtcState.textContent = "媒体未接入";
     elements.audioState.textContent = "机器人音频等待中";
     elements.audioResumeButton.hidden = true;
@@ -1026,6 +1429,7 @@ async function endCurrentSession() {
   render();
   try {
     await stopLocalMicrophone();
+    await stopNativeAudio();
     await apiRequest(
       `/api/robot-sessions/${encodeURIComponent(sessionId)}/end`,
       { method: "POST", body: {} },
@@ -1070,11 +1474,27 @@ function handleRtcEvent(event) {
       }
       break;
     case "remote-user":
+      if (state.ignoredMediaUserIds.has(event.userId)) {
+        if (event.online) {
+          state.rtc?.muteRemoteAudio(event.userId, true);
+        }
+        break;
+      }
+      if (event.online && event.userId === state.robotMediaUserId) {
+        applyRobotAudioVolume();
+      }
       if (!event.online) {
         elements.audioState.textContent = "远端媒体已离开";
       }
       break;
     case "audio-subscription":
+      if (state.ignoredMediaUserIds.has(event.userId)) {
+        state.rtc?.muteRemoteAudio(event.userId, true);
+        break;
+      }
+      if (event.userId === state.robotMediaUserId) {
+        applyRobotAudioVolume();
+      }
       if (event.newState === 3) {
         elements.audioState.textContent = "机器人音频已接入";
         elements.audioResumeButton.hidden = true;
@@ -1298,7 +1718,7 @@ function handleControlMessage(message) {
         state.lease?.sessionId === message.sessionId
         && state.lease?.id === message.lease?.id
       ) {
-        void stopLocalMicrophone();
+        void stopNativeAudio();
         state.lease = null;
         state.leaseUncertain = false;
         window.clearTimeout(state.leaseRenewTimer);
@@ -1361,6 +1781,7 @@ function handleControlMessage(message) {
 
 async function handleControlInterruption() {
   await stopLocalMicrophone();
+  await stopNativeAudio();
   if (state.lease) {
     state.leaseUncertain = true;
     window.clearTimeout(state.leaseRenewTimer);
@@ -1427,12 +1848,14 @@ function startPolling() {
     void refreshCatalog({ silent: true });
   }, CATALOG_REFRESH_MS);
   state.clockTimer = window.setInterval(() => {
-    renderLeaseTimer();
+    renderLeaseState();
   }, 1000);
 }
 
 
 function stopTimers() {
+  stopNativeHeartbeat();
+  window.clearTimeout(state.talkTokenRefreshTimer);
   window.clearTimeout(state.socketReconnectTimer);
   window.clearInterval(state.socketPingTimer);
   window.clearInterval(state.catalogTimer);
@@ -1443,6 +1866,9 @@ function stopTimers() {
   state.catalogTimer = null;
   state.clockTimer = null;
   state.leaseRenewTimer = null;
+  state.talkTokenRefreshTimer = null;
+  state.playbackVolumeTimer = null;
+  state.comboVoiceTimer = null;
 }
 
 
@@ -1470,6 +1896,7 @@ async function forceLogout(message) {
     state.lease = null;
     state.leaseUncertain = false;
     state.microphoneEnabled = false;
+    state.ignoredMediaUserIds.clear();
     elements.agentName.textContent = "";
     elements.sessionList.replaceChildren();
     elements.sessionEmpty.hidden = false;
@@ -1510,6 +1937,7 @@ async function logout() {
     state.lease = null;
     state.leaseUncertain = false;
     state.microphoneEnabled = false;
+    state.ignoredMediaUserIds.clear();
     elements.agentName.textContent = "";
     elements.sessionList.replaceChildren();
     elements.sessionEmpty.hidden = false;
@@ -1524,9 +1952,8 @@ function sendPageExitRequests() {
   if (!state.accessToken) {
     return;
   }
-  if (state.microphoneEnabled) {
-    void state.rtc?.setMicrophone(false);
-  }
+  stopNativeHeartbeat();
+  void state.nativeAudio?.stop({ keepalive: true });
   if (state.lease?.sessionId) {
     void apiRequest(
       `/api/robot-sessions/${encodeURIComponent(state.lease.sessionId)}/takeover-lease/release`,
@@ -1554,6 +1981,28 @@ function bindEvents() {
   elements.takeoverButton.addEventListener("click", () => void acquireTakeover());
   elements.releaseButton.addEventListener("click", () => void releaseTakeover());
   elements.microphoneButton.addEventListener("click", () => void toggleMicrophone());
+  elements.voiceMode.addEventListener("change", () => void changeVoiceMode());
+  elements.robotAudioVolume.addEventListener("input", (event) => {
+    updateRobotAudioVolume(event.target.value);
+  });
+  elements.agentPlaybackVolume.addEventListener("input", (event) => {
+    updateAgentPlaybackVolume(event.target.value);
+  });
+  for (const control of [
+    elements.comboPitch,
+    elements.comboLowGain,
+    elements.comboMidGain,
+    elements.comboHighGain,
+  ]) {
+    control.addEventListener("input", handleComboVoiceInput);
+  }
+  for (const control of [
+    elements.comboBaseVoice,
+    elements.comboReverb,
+    elements.comboBeautify,
+  ]) {
+    control.addEventListener("change", handleComboVoiceInput);
+  }
   elements.audioResumeButton.addEventListener("click", () => {
     void state.rtc?.resumeRemoteAudio();
   });
@@ -1575,6 +2024,90 @@ async function loadAgentConfig() {
     throw new Error("backendUrl 必须使用 http:// 或 https://");
   }
   state.backendUrl = backend.toString().replace(/\/$/, "");
+  state.nativeAudioAvailable = Boolean(payload.nativeAudioAvailable);
+  state.agentControlToken = String(payload.agentControlToken || "");
+  const voiceModes = Array.isArray(payload.voiceModes) ? payload.voiceModes : [];
+  if (voiceModes.length === 0) {
+    throw new Error("客服工作台没有可用的音色改变列表");
+  }
+  const labels = {};
+  const values = new Set();
+  const options = voiceModes.map((mode) => {
+    const value = Number(mode?.value);
+    const label = String(mode?.label || "").trim();
+    const sdkName = String(mode?.sdkName || "").trim();
+    if (!Number.isInteger(value) || value < 0 || !label || values.has(value)) {
+      throw new Error("客服工作台音色改变列表无效");
+    }
+    values.add(value);
+    labels[value] = label;
+    const option = document.createElement("option");
+    option.value = String(value);
+    option.textContent = label;
+    if (sdkName) {
+      option.title = sdkName;
+    }
+    return option;
+  });
+  state.voiceModeLabels = labels;
+  if (!(state.voiceMode in labels)) {
+    state.voiceMode = 0;
+  }
+  elements.voiceMode.replaceChildren(...options);
+  elements.voiceMode.value = String(state.voiceMode);
+
+  const baseVoiceModes = voiceModes.filter(
+    (mode) => Number(mode.value) >= 0 && Number(mode.value) <= 11,
+  );
+  const reverbModes = Array.isArray(payload.reverbModes) ? payload.reverbModes : [];
+  const beautifyModes = Array.isArray(payload.beautifyModes) ? payload.beautifyModes : [];
+  const comboDefaults = payload.comboVoiceDefaults;
+  if (
+    baseVoiceModes.length === 0
+    || reverbModes.length === 0
+    || beautifyModes.length === 0
+    || !comboDefaults
+  ) {
+    throw new Error("客服工作台组合音色配置无效");
+  }
+  elements.comboBaseVoice.replaceChildren(
+    ...baseVoiceModes.map((mode) => {
+      const option = document.createElement("option");
+      option.value = String(mode.value);
+      option.textContent = String(mode.label);
+      return option;
+    }),
+  );
+  const populateModeSelect = (select, modes) => {
+    select.replaceChildren(
+      ...modes.map((mode) => {
+        const option = document.createElement("option");
+        option.value = String(mode.value);
+        option.textContent = String(mode.label);
+        return option;
+      }),
+    );
+  };
+  populateModeSelect(elements.comboReverb, reverbModes);
+  populateModeSelect(elements.comboBeautify, beautifyModes);
+  state.comboVoiceDefaults = {
+    baseVoiceMode: Number(comboDefaults.baseVoiceMode),
+    pitch: Number(comboDefaults.pitch),
+    reverbMode: Number(comboDefaults.reverbMode),
+    beautifyMode: Number(comboDefaults.beautifyMode),
+    lowGain: Number(comboDefaults.lowGain),
+    midGain: Number(comboDefaults.midGain),
+    highGain: Number(comboDefaults.highGain),
+  };
+  state.comboVoiceLabels = {
+    reverb: Object.fromEntries(
+      reverbModes.map((mode) => [Number(mode.value), String(mode.label)]),
+    ),
+    beautify: Object.fromEntries(
+      beautifyModes.map((mode) => [Number(mode.value), String(mode.label)]),
+    ),
+  };
+  setComboVoiceControls(state.comboVoiceDefaults);
   state.configReady = true;
   setLoginBusy(false);
 }

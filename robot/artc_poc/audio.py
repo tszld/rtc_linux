@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import array
+import audioop
 import queue
 import shutil
 import subprocess
@@ -25,6 +26,9 @@ class PcmOutput(Protocol):
     def close(self) -> None:
         ...
 
+    def set_volume(self, volume: int) -> None:
+        ...
+
 
 def s16le_peak(data: bytes) -> int:
     """返回 16-bit little-endian PCM 样本的最大绝对值。"""
@@ -37,12 +41,25 @@ def s16le_peak(data: bytes) -> int:
     return max((abs(sample) for sample in samples), default=0)
 
 
+def apply_pcm_gain(data: bytes, volume: int) -> bytes:
+    if not isinstance(volume, int) or volume < 0 or volume > 100:
+        raise ValueError("PCM 音量必须是 0-100 的整数")
+    if len(data) % 2:
+        raise ValueError("16-bit PCM 数据长度必须是偶数字节")
+    if volume == 100:
+        return data
+    if volume == 0:
+        return b"\x00" * len(data)
+    return audioop.mul(data, 2, volume / 100)
+
+
 class NullPcmOutput:
     """用于无声卡环境的显式静音输出。"""
 
     def __init__(self) -> None:
         self.frame_count = 0
         self.byte_count = 0
+        self.volume = 100
 
     def feed(self, frame: PcmFrame) -> None:
         self.frame_count += 1
@@ -50,6 +67,11 @@ class NullPcmOutput:
 
     def close(self) -> None:
         return
+
+    def set_volume(self, volume: int) -> None:
+        if not isinstance(volume, int) or volume < 0 or volume > 100:
+            raise ValueError("PCM 音量必须是 0-100 的整数")
+        self.volume = volume
 
 
 class FfplayPcmOutput:
@@ -67,6 +89,8 @@ class FfplayPcmOutput:
         self._process: subprocess.Popen[bytes] | None = None
         self._failure: str | None = None
         self._closed = False
+        self._volume = 100
+        self._volume_lock = threading.Lock()
         self._worker = threading.Thread(
             target=self._run,
             name="artc-pcm-player",
@@ -104,6 +128,12 @@ class FfplayPcmOutput:
                 pass
             self._frames.put_nowait(frame)
 
+    def set_volume(self, volume: int) -> None:
+        if not isinstance(volume, int) or volume < 0 or volume > 100:
+            raise ValueError("PCM 音量必须是 0-100 的整数")
+        with self._volume_lock:
+            self._volume = volume
+
     def _run(self) -> None:
         try:
             while True:
@@ -135,7 +165,11 @@ class FfplayPcmOutput:
                     )
                 if self._process.stdin is None:
                     raise RuntimeError("ffplay 标准输入不可用")
-                self._process.stdin.write(frame.data)
+                with self._volume_lock:
+                    volume = self._volume
+                self._process.stdin.write(
+                    apply_pcm_gain(frame.data, volume)
+                )
                 self._process.stdin.flush()
         except (BrokenPipeError, OSError, RuntimeError) as exc:
             self._failure = f"播放远端 PCM 失败：{exc}"

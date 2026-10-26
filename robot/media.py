@@ -18,6 +18,7 @@ class RobotMediaController:
         self.session: RobotPoCSession | None = None
         self.audio_publisher: TonePublisher | MicrophonePublisher | None = None
         self.session_id: str | None = None
+        self.agent_playback_volume = 100
 
     @property
     def is_active(self) -> bool:
@@ -71,6 +72,7 @@ class RobotMediaController:
             raise
         self.session = session
         self.session_id = session_id
+        session.set_remote_playback_volume(self.agent_playback_volume)
 
     def set_microphone(self, enabled: bool) -> None:
         if self.session is None:
@@ -88,6 +90,13 @@ class RobotMediaController:
             if self.audio_publisher is not None:
                 self.audio_publisher.pump()
             pump_events(0.02)
+
+    def set_agent_playback_volume(self, volume: int) -> None:
+        if not isinstance(volume, int) or volume < 0 or volume > 100:
+            raise ValueError("客服播放音量必须是 0-100 的整数")
+        self.agent_playback_volume = volume
+        if self.session is not None:
+            self.session.set_remote_playback_volume(volume)
 
     def state(self, *, automatic_speech_paused: bool) -> dict[str, Any]:
         return {

@@ -59,6 +59,7 @@ class FakeRobotMedia:
         self.started = False
         self.session_id = None
         self.microphone_enabled = False
+        self.agent_playback_volume = 100
         self.stopped = False
 
     @property
@@ -71,6 +72,9 @@ class FakeRobotMedia:
 
     def set_microphone(self, enabled):
         self.microphone_enabled = enabled
+
+    def set_agent_playback_volume(self, volume):
+        self.agent_playback_volume = volume
 
     def pump(self):
         return
@@ -138,6 +142,15 @@ class RobotBusinessRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(self.media.microphone_enabled)
         self.assertTrue(self.api.media_states[-1]["automatic_speech_paused"])
+
+        self.runtime._handle_event(
+            {
+                "type": "agent_playback_volume_changed",
+                "sessionId": "session-1",
+                "volume": 42,
+            }
+        )
+        self.assertEqual(self.media.agent_playback_volume, 42)
 
         self.runtime._handle_event(
             {

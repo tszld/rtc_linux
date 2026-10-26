@@ -3,8 +3,9 @@
 更新日期：2026-10-23。
 
 本文确定 T1 的接口、数据模型、状态和配置。机器人端和控制端部署在 Linux；机器人
-使用阿里云 ARTC Linux Python SDK，客服 Web 服务可运行在 Windows 或 Linux，
-媒体由浏览器中的 ARTC Web SDK 处理。
+使用阿里云 ARTC Linux Python SDK。客服 Web 服务可运行在 Windows 或 Linux；
+浏览器 ARTC Web SDK 接收机器人音频和视频，Windows ARTC 原生音频助手只发布经过
+变声的客服麦克风。
 
 ## 1. 运行组件与 ARTC
 
@@ -12,6 +13,7 @@
 robot/   业务会话、心跳、机器人媒体、人工接管暂停/恢复
 server/  身份、场景、机器人、业务会话、租约、Token、WebSocket、审计
 agent/   独立托管客服页面、管理页面和 ARTC Web SDK
+agent/native/ Windows ARTC SDK 客服麦克风变声助手
 ARTC     仅认证频道/用户并传输媒体
 ```
 
@@ -248,11 +250,13 @@ GET  /api/robot-sessions
 POST /api/robot-sessions/{session_id}/claim
 POST /api/robot-sessions/{session_id}/claim/release
 POST /api/robot-sessions/{session_id}/viewer-token
+POST /api/robot-sessions/{session_id}/talk-token
 POST /api/robot-sessions/{session_id}/takeover-lease
 POST /api/robot-sessions/{session_id}/takeover-lease/renew
 POST /api/robot-sessions/{session_id}/takeover-lease/release
 POST /api/robot-sessions/{session_id}/takeover-lease/microphone
 POST /api/robot-sessions/{session_id}/listen
+POST /api/robot-sessions/{session_id}/agent-playback-volume
 ```
 
 ### 管理员
@@ -324,7 +328,9 @@ ping
 
 - 每台机器人独立 `channelId`。
 - 机器人 ARTC userId：`robot-<business robot id>`。
-- 客服 ARTC userId：`agent-<business agent id>`。
+- 浏览器观看 ARTC userId：`agent-<business agent id>`。
+- Windows 麦克风发布 ARTC userId：`agent-<business agent id>-talk`。
+- `talk-token` 只在客服持有有效接管租约时签发，不能替代现有观看 Token。
 - userId 最长 64 字符，只包含字母、数字、`-`、`_`。
 - 后端用 `config.json` 的 `server.app_id/server.app_key` 生成短期单参数 Token。
 - 默认有效期 600 秒，HTTP 响应返回 `expiresAt`。
@@ -332,6 +338,8 @@ ping
 - Linux Python SDK 当前包未暴露 Token 刷新接口；机器人到期前需重新获取 Token 入会。
 - Web SDK 在 `authInfoWillExpire` 时重新请求短期 Token，并调用
   `refreshAuthInfo`；刷新失败时停止客服发布并离会。
+- Windows 助手使用 `RefreshAuthInfo` 刷新麦克风身份 Token；本地心跳超过 30 秒
+  未更新时停止并退出。
 
 ## 10. 配置
 

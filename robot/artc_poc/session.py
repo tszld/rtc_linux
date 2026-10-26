@@ -132,6 +132,9 @@ class RobotPoCSession:
             raise PoCSessionError(f"切换机器人麦克风失败：{result}")
         self.microphone_enabled = enabled
 
+    def set_remote_playback_volume(self, volume: int) -> None:
+        self.audio_output.set_volume(volume)
+
     def on_join_result(self, result: int, channel: str, user_id: str) -> None:
         if result == 0:
             self.state = "joined"

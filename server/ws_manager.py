@@ -70,6 +70,10 @@ class WebSocketManager:
             connections = list(self._robots.get(robot_id, ()))
         await self._send_many(self._robots, robot_id, connections, message)
 
+    async def is_robot_connected(self, robot_id: str) -> bool:
+        async with self._lock:
+            return bool(self._robots.get(robot_id))
+
     async def broadcast_to_agents(
         self,
         agent_ids: Iterable[str],

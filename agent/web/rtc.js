@@ -188,6 +188,32 @@ export class AgentRtcSession {
     this._emit("microphone", { enabled: this.microphoneEnabled });
   }
 
+  muteRemoteAudio(userId, muted) {
+    if (!this.engine || !this.joined || !userId) {
+      return;
+    }
+    try {
+      this.engine.muteRemoteAudioPlaying(userId, Boolean(muted));
+    } catch (_error) {
+      // 远端用户尚未订阅音频时，由其上线事件再次尝试。
+    }
+  }
+
+  setRemoteAudioVolume(userId, volume) {
+    if (!this.engine || !this.joined || !userId) {
+      return;
+    }
+    const normalized = Math.max(0, Math.min(100, Number(volume)));
+    if (!Number.isFinite(normalized)) {
+      return;
+    }
+    try {
+      this.engine.setRemoteAudioVolume(userId, normalized);
+    } catch (_error) {
+      // 远端用户尚未订阅音频时，由其上线或订阅事件再次应用。
+    }
+  }
+
   async refreshToken(auth) {
     if (!this.engine || !this.joined) {
       throw new Error("媒体会话未接入");

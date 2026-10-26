@@ -58,6 +58,7 @@ from .models import (
     ListenRequest,
     LoginRequest,
     MediaStateRequest,
+    PlaybackVolumeRequest,
     RobotLoginRequest,
     RobotRegisterRequest,
     SetAgentScenariosRequest,
@@ -686,6 +687,59 @@ def create_app(
             )
         return {**auth, "sessionId": session_id}
 
+    @app.post("/api/robot-sessions/{session_id}/talk-token")
+    async def talk_token(
+        session_id: str,
+        principal: Principal = Depends(require_agent),
+    ) -> dict[str, Any]:
+        with resolved_db.connection() as connection:
+            session = ensure_session_access(
+                connection,
+                actor=principal,
+                session_id=session_id,
+            )
+            if session["status"] == "ended":
+                raise ServiceError("业务会话已经结束", 409)
+            ensure_session_claim(
+                connection,
+                actor=principal,
+                session=session,
+            )
+
+        active_lease = get_active_lease(
+            resolved_db,
+            robot_id=session["robot_id"],
+        )
+        if (
+            active_lease is None
+            or active_lease["sessionId"] != session_id
+            or active_lease["agentId"] != principal.id
+        ):
+            raise ServiceError("没有有效的接管租约，不能获取麦克风 Token", 409)
+
+        auth = make_rtc_auth(
+            resolved_config,
+            channel_id=session["channel_id"],
+            user_id=f"agent-{principal.id}-talk",
+            user_name=f"{principal.display_name} 语音",
+        )
+        with resolved_db.transaction() as connection:
+            insert_audit(
+                connection,
+                actor_type="agent",
+                actor_id=principal.id,
+                action="talk_token_issued",
+                target_type="robot_session",
+                target_id=session_id,
+                metadata={"leaseId": active_lease["id"]},
+            )
+        return {
+            **auth,
+            "sessionId": session_id,
+            "leaseId": active_lease["id"],
+            "role": "talk",
+        }
+
     @app.post("/api/robot-sessions/{session_id}/takeover-lease")
     async def takeover_acquire(
         session_id: str,
@@ -818,6 +872,45 @@ def create_app(
         )
         await _broadcast_listen_state(resolved_db, manager, result)
         return result
+
+    @app.post(
+        "/api/robot-sessions/{session_id}/agent-playback-volume"
+    )
+    async def set_agent_playback_volume(
+        session_id: str,
+        body: PlaybackVolumeRequest,
+        principal: Principal = Depends(require_agent),
+    ) -> dict[str, Any]:
+        with resolved_db.connection() as connection:
+            session = ensure_session_access(
+                connection,
+                actor=principal,
+                session_id=session_id,
+            )
+            ensure_session_claim(
+                connection,
+                actor=principal,
+                session=session,
+            )
+            if session["status"] == "ended":
+                raise ServiceError("业务会话已经结束", 409)
+
+        delivered = await manager.is_robot_connected(session["robot_id"])
+        await manager.send_to_robot(
+            session["robot_id"],
+            {
+                "type": "agent_playback_volume_changed",
+                "robotId": session["robot_id"],
+                "sessionId": session_id,
+                "volume": body.volume,
+                "occurredAt": utc_now_text(),
+            },
+        )
+        return {
+            "sessionId": session_id,
+            "volume": body.volume,
+            "delivered": delivered,
+        }
 
     @app.get("/api/admin/scenarios")
     async def admin_scenarios(

@@ -50,7 +50,7 @@
 ## 3. 新目标架构
 
 目标是业务语音机器人与人工客服协作平台，包含两个 Linux 运行组件、一个浏览器
-客服工作台和阿里云 ARTC：
+客服工作台、一个 Windows 原生音频助手和阿里云 ARTC：
 
 ```text
 robot/  Linux 机器人端
@@ -64,6 +64,9 @@ server/ Linux 业务后端
 agent/web/  Web 客服工作台
         阿里云 ARTC Web SDK
         独立静态服务、业务会话查看、人工接管和浏览器媒体状态
+agent/native/ Windows 音频助手
+        阿里云 ARTC Windows SDK
+        使用独立 userId 发布变声后的客服麦克风
 
 阿里云 ARTC
         音视频媒体传输，不经过业务后端
@@ -78,7 +81,8 @@ agent/web/  Web 客服工作台
 - 业务后端只做控制面，不转发、转码、录制或保存音视频。
 - 每台机器人使用独立 ARTC 频道。
 - 机器人端使用 ARTC Linux Python SDK。
-- 客服端使用阿里云 ARTC Web SDK，由独立 `agent` Web 服务托管；页面跨源调用控制端。
+- 客服 Web 页面使用阿里云 ARTC Web SDK 接收机器人音频和可选视频；Windows 原生
+  音频助手使用 ARTC Windows SDK 发布经过变声的客服麦克风。
 - 业务后端、机器人端和测试工具部署在 Linux；客服 Web 服务和浏览器可运行在同一台
   Windows 或 Linux 电脑上。
 - 同一频道两端使用不同且稳定的 `userId`。
@@ -87,9 +91,8 @@ agent/web/  Web 客服工作台
 - ARTC Token 主要认证频道和用户；人工接管独占锁由业务后端保证，除非后续确认
   ARTC Token 能直接限制发布权限，否则不得宣称 Token 已完成接管权限隔离。
 - 所有机器人/客服共享一个逻辑业务后端，不允许每个客服各部署一套。
-- 当前阶段只使用阿里云 ARTC Linux Python SDK 和 ARTC Web SDK，不引入原生 Windows
-  媒体客户端、PostgreSQL、Redis、消息队列、Docker 或多 Uvicorn worker；确有需要时
-  先确认。
+- 原生 Windows 端只允许作为客服麦克风变声助手，不承担页面、视频渲染、远端音频播放
+  或业务控制。不得引入 PostgreSQL、Redis、消息队列、Docker 或多 Uvicorn worker。
 
 ## 4. 业务状态与并发约束
 
@@ -126,6 +129,8 @@ active <-> agent_takeover
 - 同一机器人同一时间只允许一个客服人工接管。
 - 客服只能接入自己已认领的会话；未认领和已被其他客服占用的会话不可接入。
 - 人工接管期间，机器人应暂停自动业务语音/TTS，并播放客服音频；释放后恢复业务状态。
+- 客服端必须分别控制“本机听到的机器人音量”和“机器人端播放的客服音量”；后者
+  通过控制面事件下发，不得混淆为客服麦克风发送音量。
 - 不允许隐蔽监听。机器人和客服界面必须显示麦克风、人工接管和可选摄像头状态。
 - 业务语音、人工接管和可选摄像头功能必须支持明确停止。
 
@@ -170,6 +175,8 @@ active <-> agent_takeover
 `agent/` 是独立的浏览器客服工作台，`server/` 不托管页面：
 
 - 使用阿里云 ARTC Web SDK，脚本版本和完整性固定在仓库内。
+- 使用独立 `agent/native/` Windows 音频助手发布变声客服麦克风；助手不订阅远端
+  音视频，不保存或转发媒体。
 - `agent/web_host.py` 默认监听 `127.0.0.1:8100`，只提供页面、脚本和运行时配置。
 - 页面通过 `backend_url` 指定的 REST 和 WebSocket 访问控制端。
 - 登录字段和访问 Token 只保存在页面内存，不使用浏览器持久化存储。
@@ -222,10 +229,11 @@ python -m compileall -q server robot agent tools tests
 Linux ARTC Python SDK 不是普通 pip 包。真实机器人验证必须在 Linux 环境使用官方
 SDK 包，包含 `AliRtcCoreService` 和 `libAliRtcLinuxEngine.so`。
 
-真实 Linux 机器人 + Web 客服跨 SDK 媒体联调：
+真实 Linux 机器人 + Web 客服 + Windows 变声助手跨 SDK 媒体联调：
 
-在 Linux 启动控制端和机器人，使用与服务器网络连通的 Chrome 或 Edge 打开
-`agent` 服务地址，分别验证机器人音频、人工接管、客服麦克风和可选视频。
+在 Linux 启动控制端和机器人，在 Windows 启动 `agent` 与本机音频助手，使用 Chrome
+或 Edge 打开 `agent` 服务地址，分别验证机器人音频、人工接管、变声客服麦克风和
+可选视频。
 
 ## 8. 测试与验收
 
@@ -235,12 +243,14 @@ SDK 包，包含 `AliRtcCoreService` 和 `libAliRtcLinuxEngine.so`。
 - ARTC Token 生成用固定输入测试格式，不记录真实 AppKey。
 - 机器人 SDK 必须提供可替换的适配接口和假实现。
 - Web 客服静态路由、SDK 版本完整性、默认关闭发布和控制面约束必须有测试。
+- Windows 音频助手必须验证入会前关麦、双 userId、Token 范围、心跳超时退出、
+  变声调用和安全停止。
 - 控制端不得托管客服页面；跨源访问必须由 `cors_origins` 明确允许。
 
 真实设备验收：
 
 - Linux 机器人业务语音；摄像头按业务配置验证。
-- 浏览器客服入会、机器人音频播放和客服麦克风发布。
+- 浏览器客服入会、机器人音频播放和 Windows 变声客服麦克风发布。
 - 客服人工接管到机器人扬声器。
 - 机器人默认麦克风回传。
 - Token 过期刷新。
@@ -262,18 +272,20 @@ SDK 包，包含 `AliRtcCoreService` 和 `libAliRtcLinuxEngine.so`。
 
 ## 10. 当前项目事实
 
-最近更新日期：2026-10-23。
+最近更新日期：2026-10-25。
 
-- 当前分支：`artc`。
+- 当前分支：`release-20261025(win-artc)`。
 - 当前工作树包含 Linux 机器人端、Linux 业务后端、跨 Windows/Linux 的 Web 客服
-  工作台、测试和工具。
+  工作台、Windows ARTC 变声音频助手、测试和工具。
 - 控制端、机器人端和 Web 客服工作台保留三个独立入口；客服 Web 页面由 `agent` 独立
   托管，控制端只提供 REST/WebSocket 控制面。
 - 原 Linux Python 客服端及其终端联调工具已移除。
 - ARTC Web SDK 固定为 `7.3.4`，随仓库提供并校验 SHA-256。
+- Windows 音频助手使用 ARTC Windows SDK `7.6.0`，本机构建产物不进入版本库。
 - T1-T6 的业务后端、并发接管、机器人业务运行器、Web 客服、管理员和审计代码
   已落地；T7/T8 自动化、联调和安全检查工具已提供。
-- Linux 机器人 + Web 客服跨 SDK 真实音频、物理麦克风和视频尚未完成验收。
+- Linux 机器人 + Web 客服 + Windows 变声助手跨 SDK 真实音频、物理麦克风和视频
+  尚未完成实机验收。
 - Windows 客服浏览器与 Linux 控制端之间的 Tailscale 控制链路需要实机验收。
 - 网络重连和长时间运行尚未完成验收。
 

@@ -1,8 +1,9 @@
 # ARTC 业务语音机器人与客服协作平台
 
 项目由 Linux 机器人端、Linux 业务控制端和浏览器客服工作台组成。机器人媒体使用
-阿里云 ARTC Linux Python SDK，客服媒体使用阿里云 ARTC Web SDK，业务后端不转发或
-保存音视频。
+阿里云 ARTC Linux Python SDK。客服 Web 工作台使用 ARTC Web SDK 接收机器人音视频，
+Windows 原生音频助手使用 ARTC Windows SDK 发布经过变声的客服麦克风。业务后端不
+转发或保存音视频。
 
 ## 架构
 
@@ -10,8 +11,9 @@
 robot/       Linux ARTC Python SDK 机器人
 server/      FastAPI + SQLite 业务控制面
 agent/web/   ARTC Web SDK 浏览器客服工作台
+agent/native/ Windows ARTC SDK 客服麦克风变声助手
 agent/web_host.py
-             独立客服 Web 静态服务
+             独立客服 Web 服务和本地音频控制
 agent/web/vendor/aliyun-rtc-sdk.js
              阿里云 ARTC Web SDK 7.3.4
 tools/       Token、机器人联调和秘密扫描工具
@@ -92,8 +94,10 @@ curl http://<控制端Tailscale-IP>:8000/api/health
 
 ### 第 2 步：启动 Windows 客服和管理员页面
 
-在 Windows 项目根目录创建 `config.json`，只配置共享控制地址和 `agent` 节。这里不
-需要 AppKey、数据库和机器人凭证：
+Windows 构建机先按 [agent/native/README.md](agent/native/README.md) 编译原生音频
+助手。最终客服电脑运行编译结果，不需要 Visual Studio。随后在项目根目录创建
+`config.json`，只配置共享控制地址和 `agent` 节。这里不需要 AppKey、数据库和机器人
+凭证：
 
 ```json
 {
@@ -229,7 +233,8 @@ http://127.0.0.1:8100/
 ## 环境
 
 - 控制端、机器人端：Linux x86_64。
-- 客服工作台：Windows 10/11 或 Linux，浏览器使用 Chrome/Edge。
+- 客服 Web 工作台：Windows 10/11 或 Linux，浏览器使用 Chrome/Edge；变声麦克风
+  助手仅支持 Windows x64。
 - Conda 环境 `rtc`，Python 3.10.x。
 - 阿里云 ARTC Linux SDK 7.11.0，放在被忽略的 `robot/vendor/`。
 - 机器人真实麦克风通过系统默认输入源和 `parecord` 采集，运行机需提供该命令。
@@ -240,8 +245,206 @@ conda activate rtc
 python --version
 ```
 
-Windows 客服电脑只需安装 Python 3.10.x；Web 工作台使用标准库启动，不需要 PySide6
-或 npm。
+Windows 客服电脑需要 Python 3.10.x 和已构建的 `agent/native/bin/` 运行目录，但
+不需要 Visual Studio、Qt 或 npm。只有构建原生助手时需要 Visual Studio 2022、
+Windows SDK 和阿里云 ARTC Windows SDK。发布电脑还需要 Microsoft Visual C++
+2015-2022 x64 Redistributable。
+
+### Windows 客服部署包
+
+`agent/native/bin/` 应包含：
+
+```text
+rtc_native_audio.exe
+AliRTCSdk.dll
+alivcffmpeg.dll
+alivcx265.dll
+PluginAAC.dll
+x264.dll
+vc_redist.x64.exe
+```
+
+其中五个 DLL 必须与 `rtc_native_audio.exe` 同目录。`vc_redist.x64.exe` 是运行库
+安装程序，不会因为放在项目目录里而自动安装。新客服电脑首次部署时执行一次：
+
+```powershell
+.\agent\native\bin\vc_redist.x64.exe
+```
+
+如果电脑已经安装相同或更新版本的 Microsoft Visual C++ 2015-2022 x64
+Redistributable，安装程序会提示已安装，不需要降级。
+
+Windows 客服电脑的最低部署要求：
+
+| 项目 | 是否已随项目提供 | 目标机操作 |
+|---|---|---|
+| 阿里云 ARTC 五个运行 DLL | 是，位于 `agent/native/bin/` | 保持与助手 EXE 同目录 |
+| VC++ 2015-2022 x64 运行库 | 是，提供安装程序 | 首次运行 `vc_redist.x64.exe` |
+| ARTC Windows SDK | 已包含必要 DLL | 不安装 SDK，不需要 `.lib/.h` |
+| Visual Studio / MSVC / Windows API SDK | 不需要 | 不安装 |
+| Python 3.10 x64 | 需要 | 安装 Python |
+| Chrome 或 Edge | 需要 | 安装现代浏览器 |
+| 控制端网络连通性 | 需要 | 能访问 `cluster.control_url`；使用 Tailscale 时登录同一 tailnet |
+| 麦克风、扬声器和摄像头 | 设备驱动由系统提供 | 无需额外框架 |
+
+因此，Windows 客服机不是“一个文件都不用装”：仍需 Python、浏览器和一次性 VC++
+运行库。除此之外不需要安装 Visual Studio、Windows SDK 或阿里云 ARTC Windows SDK。
+若以后用 PyInstaller 等工具把 Python 也打包，目标机才不需要单独安装 Python。
+
+### 一键部署脚本
+
+根目录提供：
+
+```text
+deploy-agent.cmd
+deploy-agent.ps1
+```
+
+正常客服电脑已安装 Python 并把 `python` 加入 PATH 时，可以双击：
+
+```text
+deploy-agent.cmd
+```
+
+部署脚本不会在这台客服电脑上编译 C++，而是直接检查 Git 仓库中预先构建并提交的
+`agent/native/bin/`。客服电脑因此不需要 Visual Studio、MSVC 或 Windows SDK。
+
+如果使用 Mamba/Conda 的 `rtc` 环境，先在已初始化 Mamba 的终端中激活：
+
+```powershell
+mamba activate rtc
+.\deploy-agent.cmd
+```
+
+没有激活环境或 `python` 不在 PATH 时，显式传入解释器：
+
+```powershell
+.\deploy-agent.cmd `
+  -PythonPath D:\ProgramFiles\Miniforge3\envs\rtc\python.exe
+```
+
+只检查部署环境、不启动客服：
+
+```powershell
+.\deploy-agent.cmd `
+  -PythonPath D:\ProgramFiles\Miniforge3\envs\rtc\python.exe `
+  -CheckOnly
+```
+
+脚本会：
+
+- 检查 Python 是否为 3.10 x64。
+- 检查 `config.json`、`cluster.control_url` 和 `agent` 节。
+- 检查 Windows 助手、五个 ARTC DLL 和 `vc_redist.x64.exe`。
+- 检查 VC++ x64 运行库；缺失时请求管理员权限并运行项目内安装程序。
+- 检查 Chrome 或 Edge 是否可用。
+- 通过检查后执行 `python main.py agent`。
+
+可用参数：
+
+```text
+-NoBrowser               启动后不自动打开浏览器
+-CheckOnly               只检查，不启动客服
+-SkipVCRuntimeInstall    不自动安装缺失的 VC++ 运行库
+-PythonPath <path>       指定 python.exe
+```
+
+脚本不会自动安装 Python、浏览器或修改 `config.json`。Linux 控制端和机器人端的
+部署步骤仍按本文前面的说明执行。
+
+### SDK、构建和仓库边界
+
+```text
+agent/native/rtc_native_audio.cpp   我们维护的 C++ 源码
+agent/native/build/                 MSVC 中间文件，Git 忽略
+agent/native/vendor/                Windows ARTC SDK 编译输入，Git 忽略
+agent/native/bin/                  可直接部署的预编译运行目录，Git 跟踪
+```
+
+`vendor/` 不是运行时必需目录。它包含阿里云 SDK 的头文件、`.lib` 和运行时 DLL，
+只在开发机重新编译时使用。最终客服电脑使用已经提交到 Git 的 `bin/`：
+
+```text
+agent/native/bin/rtc_native_audio.exe
+agent/native/bin/AliRTCSdk.dll
+agent/native/bin/alivcffmpeg.dll
+agent/native/bin/alivcx265.dll
+agent/native/bin/PluginAAC.dll
+agent/native/bin/x264.dll
+agent/native/bin/vc_redist.x64.exe
+```
+
+开发者修改 C++ 后执行 `agent/native/build.ps1`，再把更新后的 `bin/` 连同源码一起
+提交。普通客服电脑克隆 Git 仓库后直接运行 `deploy-agent.cmd`，不会触发编译。
+
+### 客服音色改变
+
+Windows ARTC SDK `7.6.0` 的
+`AliEngineAudioEffectVoiceChangerMode` 共提供 12 个值，工作台全部列出，并额外提供一个
+由多种 SDK 音效组合成的扩展选项：
+
+```text
+关闭、老人、男孩、女孩、机器人、大魔王、KTV、回声、方言、怒吼、电音、留声机、
+自定义组合音色（可调女声）、接近 longanqian（原生女声）、
+接近 longanqian（男声转女声）
+```
+
+选项由 Python 音频控制层统一下发，不依赖前端手工维护。取得会话后可以先选择模式；
+启动 Windows 助手时会先应用模式并等待 SDK 返回成功，再开始入会。接管过程中切换
+模式会立即调用 `SetAudioEffectVoiceChangerMode`，SDK 返回失败时界面回滚到原模式。
+麦克风开启后，机器人收到的是当前模式处理后的客服音频。
+
+“自定义组合音色（可调女声）”默认由以下 SDK 参数组成：
+
+```text
+基础变声：女孩
+音调：1.10
+混响：人声 I
+美声：嘹亮
+均衡器：250 Hz -1 dB，1 kHz +2 dB，4 kHz +3 dB
+```
+
+客服可以在线调整基础音色、音调、混响、美声以及低/中/高频增益。每次调整会重新
+下发完整参数并等待 Windows SDK 返回结果。切换到普通预设时会重置音调、混响、
+美声和全部均衡器，避免组合效果残留。
+
+### 双向音量
+
+工作台提供两个独立音量滑块：
+
+```text
+机器人声音
+  控制客服电脑扬声器播放的机器人声音。
+  使用 Web SDK setRemoteAudioVolume，仅影响客服本地播放。
+
+客服声音
+  控制机器人扬声器播放的客服声音。
+  由控制端下发到机器人，通过 PCM 播放增益调节，不改变客服麦克风上行音量。
+```
+
+`客服声音`不是客服本地音量。机器人控制 WebSocket 未连接时，接口返回
+`delivered=false`，页面会明确提示音量设置没有送达。
+
+两个 `longanqian` 固定近似预设为：
+
+```text
+接近 longanqian（原生女声）
+  基础音色：关闭
+  音调：1.01
+  混响：关闭
+  美声：嘹亮
+  低/中/高：-2 / +2 / +1 dB
+
+接近 longanqian（男声转女声）
+  基础音色：女孩
+  音调：1.12
+  混响：关闭
+  美声：嘹亮
+  低/中/高：-3 / +2 / +2 dB
+```
+
+这两个选项在服务端固定参数，客服端不能误改；继续调整组合参数时会自动切换回
+“自定义组合音色”。
 
 ## 统一配置
 
@@ -444,6 +647,9 @@ python -m tools.create_default_agent
 - 客服接入会话前由后端原子认领；一个会话只允许一名客服接入，一个客服同时只占一个会话。
 - 使用 ARTC Web SDK 接收机器人音频和可选摄像头画面。
 - 申请、续租、释放人工接管租约。
+- 使用 Windows ARTC SDK 音频助手发布经过变声的客服麦克风。
+- 独立调节客服本地听到的机器人音量和机器人端播放的客服音量。
+- 在线调整基础音色、音调、混响、美声和低/中/高频组合参数。
 - 默认关闭客服麦克风和摄像头，接管成功后按需发布客服麦克风。
 - 左侧会话卡片显示“客服通话中/客服已接管”和“麦克风已开/麦克风关闭”。
 - 机器人麦克风在活动业务会话中默认发布，客服端麦克风默认关闭。
@@ -451,7 +657,8 @@ python -m tools.create_default_agent
 - 短期 ARTC Token 到期前自动向业务后端刷新。
 
 访问 Token 和 ARTC Token 只保存在页面内存，不写入 `localStorage`、Cookie 或 URL。
-浏览器客服的 `userId` 由后端生成为 `agent-<客服业务 id>`。
+浏览器观看身份为 `agent-<客服业务 id>`；持有效接管租约时，后端额外签发
+`agent-<客服业务 id>-talk` 短期 Token，仅供本机 Windows 音频助手发布变声麦克风。
 
 ARTC Web SDK 固定为 `7.3.4`，文件 SHA-256：
 
@@ -468,13 +675,15 @@ python -m tools.secret_scan
 ```
 
 自动化测试不访问真实 ARTC 云。真实跨 SDK 验收需要同时运行 Linux 机器人和控制端，
-再启动独立 `agent` Web 服务，在浏览器中验证机器人音频、人工接管、客服麦克风、可选
-摄像头、断线重连和 Token 刷新。
+再启动独立 `agent` Web 服务和 Windows 音频助手，在浏览器中验证机器人音频、人工
+接管、Windows 变声麦克风、可选摄像头、断线重连和 Token 刷新。
 
 ## 当前限制
 
-- “Linux 机器人 + Web 客服”跨 SDK 真实媒体闭环尚未在本轮验收。
-- 物理客服麦克风、机器人扬声器听感、可选摄像头和长时间运行仍需真实设备验证。
+- “Linux 机器人 + Web 客服 + Windows 变声助手”真实跨 SDK 媒体闭环尚未完成
+  实机验收。
+- 物理客服麦克风、Windows 变声听感、机器人扬声器、可选摄像头和长时间运行仍需
+  真实设备验证。
 - 公网部署仍需 HTTPS/WSS、域名、证书、限流和账号安全配置。
 
 接口和数据模型见 [docs/artc-architecture.md](docs/artc-architecture.md)，验收状态见

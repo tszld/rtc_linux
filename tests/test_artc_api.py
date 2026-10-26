@@ -209,6 +209,24 @@ class ArtcApiTests(unittest.TestCase):
         self.assertEqual(status, 200, claimed)
         self.assertEqual(claimed["claim"]["agentId"], agent["id"])
 
+        status, _, playback_volume = self.request(
+            "POST",
+            f"/api/robot-sessions/{session['id']}/agent-playback-volume",
+            body={"volume": 45},
+            headers=agent_headers,
+        )
+        self.assertEqual(status, 200, playback_volume)
+        self.assertEqual(playback_volume["volume"], 45)
+        self.assertFalse(playback_volume["delivered"])
+
+        status, _, _ = self.request(
+            "POST",
+            f"/api/robot-sessions/{session['id']}/agent-playback-volume",
+            body={"volume": 101},
+            headers=agent_headers,
+        )
+        self.assertEqual(status, 422)
+
         status, _, viewer = self.request(
             "POST",
             f"/api/robot-sessions/{session['id']}/viewer-token",
@@ -216,6 +234,13 @@ class ArtcApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, viewer)
         self.assertEqual(viewer["channel"], robot["channelId"])
+
+        status, _, talk_before_lease = self.request(
+            "POST",
+            f"/api/robot-sessions/{session['id']}/talk-token",
+            headers=agent_headers,
+        )
+        self.assertEqual(status, 409, talk_before_lease)
 
         status, _, lease = self.request(
             "POST",
@@ -225,6 +250,18 @@ class ArtcApiTests(unittest.TestCase):
         )
         self.assertEqual(status, 200, lease)
         self.assertEqual(lease["agentId"], agent["id"])
+
+        status, _, talk = self.request(
+            "POST",
+            f"/api/robot-sessions/{session['id']}/talk-token",
+            headers=agent_headers,
+        )
+        self.assertEqual(status, 200, talk)
+        self.assertEqual(talk["channel"], robot["channelId"])
+        self.assertEqual(talk["userId"], f"agent-{agent['id']}-talk")
+        self.assertEqual(talk["leaseId"], lease["id"])
+        self.assertEqual(talk["role"], "talk")
+        self.assertNotIn("api-secret-key", talk["token"])
 
         status, _, lease_with_mic = self.request(
             "POST",
@@ -252,6 +289,13 @@ class ArtcApiTests(unittest.TestCase):
         self.assertEqual(status, 200, released)
         self.assertEqual(released["status"], "released")
         self.assertFalse(released["microphoneEnabled"])
+
+        status, _, talk_after_release = self.request(
+            "POST",
+            f"/api/robot-sessions/{session['id']}/talk-token",
+            headers=agent_headers,
+        )
+        self.assertEqual(status, 409, talk_after_release)
 
         status, _, ended_by_agent = self.request(
             "POST",

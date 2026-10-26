@@ -51,6 +51,10 @@ class ListenRequest(ApiModel):
     enabled: bool
 
 
+class PlaybackVolumeRequest(ApiModel):
+    volume: int = Field(ge=0, le=100)
+
+
 class CreateScenarioRequest(ApiModel):
     name: str
 

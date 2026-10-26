@@ -211,6 +211,21 @@ class RobotBusinessRuntime:
             self._apply_microphone_policy()
             self._report_media()
             return
+        if event_type == "agent_playback_volume_changed":
+            if event.get("sessionId") != self.current_session_id:
+                return
+            volume = event.get("volume")
+            try:
+                self.media.set_agent_playback_volume(int(volume))
+            except (TypeError, ValueError) as exc:
+                print(
+                    f"设置客服播放音量失败：{exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            else:
+                print(f"客服播放音量已设置为 {volume}。", flush=True)
+            return
         if event_type in {"heartbeat_error", "protocol_error", "error"}:
             print(
                 f"机器人控制面消息：{event_type}: {event.get('message', '')}",

@@ -143,6 +143,10 @@
                     <span class="signal-label">客服麦克风</span>
                     <strong id="microphoneState">关闭</strong>
                   </div>
+                  <div>
+                    <span class="signal-label">客服音色改变</span>
+                    <strong id="voiceState">关闭音色改变</strong>
+                  </div>
                 </div>
               </section>
 
@@ -153,7 +157,6 @@
                       <p class="eyebrow">人工接管</p>
                       <h3 id="leaseTitle">未接管</h3>
                     </div>
-                    <span id="leaseTimer" class="lease-timer">--</span>
                   </div>
                   <p id="leaseDescription" class="muted-copy">
                     当前会话尚未由人工接管。
@@ -182,6 +185,72 @@
                   <button id="microphoneButton" class="button button-wide" type="button" disabled>
                     开启麦克风
                   </button>
+                  <label class="field-label compact-label" for="voiceMode">
+                    客服音色改变
+                  </label>
+                  <select id="voiceMode" class="select-input" disabled>
+                    <option value="0">关闭音色改变</option>
+                  </select>
+
+                  <div id="comboVoicePanel" class="combo-voice-panel" hidden>
+                    <label class="field-label" for="comboBaseVoice">基础音色</label>
+                    <select id="comboBaseVoice" class="select-input"></select>
+
+                    <label class="field-label range-label" for="comboPitch">
+                      <span>音调</span>
+                      <output id="comboPitchValue" for="comboPitch">1.10</output>
+                    </label>
+                    <input id="comboPitch" type="range" min="0.5" max="2" step="0.01" value="1.1">
+
+                    <label class="field-label" for="comboReverb">混响</label>
+                    <select id="comboReverb" class="select-input"></select>
+
+                    <label class="field-label" for="comboBeautify">美声</label>
+                    <select id="comboBeautify" class="select-input"></select>
+
+                    <label class="field-label range-label" for="comboLowGain">
+                      <span>低频增益</span>
+                      <output id="comboLowGainValue" for="comboLowGain">-1 dB</output>
+                    </label>
+                    <input id="comboLowGain" type="range" min="-15" max="15" step="1" value="-1">
+
+                    <label class="field-label range-label" for="comboMidGain">
+                      <span>中频增益</span>
+                      <output id="comboMidGainValue" for="comboMidGain">2 dB</output>
+                    </label>
+                    <input id="comboMidGain" type="range" min="-15" max="15" step="1" value="2">
+
+                    <label class="field-label range-label" for="comboHighGain">
+                      <span>高频增益</span>
+                      <output id="comboHighGainValue" for="comboHighGain">3 dB</output>
+                    </label>
+                    <input id="comboHighGain" type="range" min="-15" max="15" step="1" value="3">
+                  </div>
+                </section>
+
+                <section class="control-section">
+                  <div class="section-heading">
+                    <div>
+                      <p class="eyebrow">音量控制</p>
+                      <h3>双向独立调节</h3>
+                    </div>
+                  </div>
+
+                  <label class="field-label range-label" for="robotAudioVolume">
+                    <span>机器人声音</span>
+                    <output id="robotAudioVolumeValue" for="robotAudioVolume">100%</output>
+                  </label>
+                  <input id="robotAudioVolume" type="range" min="0" max="100" step="1" value="100">
+                  <p class="muted-copy volume-description">控制客服电脑听到的机器人音量。</p>
+
+                  <label class="field-label range-label" for="agentPlaybackVolume">
+                    <span>客服声音</span>
+                    <output id="agentPlaybackVolumeValue" for="agentPlaybackVolume">100%</output>
+                  </label>
+                  <input id="agentPlaybackVolume" type="range" min="0" max="100" step="1" value="100">
+                  <p id="agentPlaybackVolumeState" class="muted-copy volume-description">
+                    控制机器人扬声器播放的客服音量。
+                  </p>
                 </section>
 
                 <section class="control-section compact-section">
