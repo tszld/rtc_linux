@@ -160,3 +160,67 @@ async def websocket_messages(
     await incoming.put({"type": "websocket.disconnect", "code": 1000})
     await asyncio.wait_for(task, timeout=2)
     return messages
+
+
+class WebSocketTestSession:
+    def __init__(self, task, incoming, outgoing) -> None:
+        self.task = task
+        self.incoming = incoming
+        self.outgoing = outgoing
+
+    async def next_message(self, timeout: float = 2) -> dict[str, Any]:
+        return await asyncio.wait_for(self.outgoing.get(), timeout=timeout)
+
+    async def close(self) -> None:
+        await self.incoming.put(
+            {"type": "websocket.disconnect", "code": 1000}
+        )
+        await asyncio.wait_for(self.task, timeout=2)
+
+
+async def open_websocket(
+    app: Any,
+    *,
+    ticket: str,
+) -> WebSocketTestSession:
+    incoming: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    outgoing: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    query = urlencode({"ticket": ticket}).encode("ascii")
+    scope = {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "scheme": "ws",
+        "path": "/ws",
+        "raw_path": b"/ws",
+        "query_string": query,
+        "root_path": "",
+        "headers": [(b"host", b"testserver")],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+        "subprotocols": [],
+    }
+
+    async def receive() -> dict[str, Any]:
+        return await incoming.get()
+
+    async def send(message: dict[str, Any]) -> None:
+        if message.get("type") == "websocket.send":
+            payload = message.get("text")
+            if payload is None and message.get("bytes") is not None:
+                payload = message["bytes"].decode("utf-8")
+            if payload is not None:
+                await outgoing.put(json.loads(payload))
+                return
+        await outgoing.put(message)
+
+    task = asyncio.create_task(app(scope, receive, send))
+    await incoming.put({"type": "websocket.connect"})
+    accepted = await asyncio.wait_for(outgoing.get(), timeout=2)
+    if accepted.get("type") != "websocket.accept":
+        await asyncio.wait_for(task, timeout=2)
+        raise AssertionError(f"WebSocket 连接失败：{accepted}")
+    snapshot = await asyncio.wait_for(outgoing.get(), timeout=2)
+    if snapshot.get("type") != "snapshot":
+        await asyncio.wait_for(task, timeout=2)
+        raise AssertionError(f"WebSocket 未返回快照：{snapshot}")
+    return WebSocketTestSession(task, incoming, outgoing)

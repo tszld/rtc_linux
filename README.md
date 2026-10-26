@@ -146,11 +146,13 @@ http://127.0.0.1:8100/admin.html
     "display_name": "<机器人名称>",
     "sdk_root": "robot/vendor/AliRTCSDK_Linux-7.11.0",
     "log_dir": "/tmp/artc-robot-logs",
+    "idle_exit_seconds": 300,
     "auto_start_session": true,
     "exit_when_session_ends": true,
     "audio_output": true,
     "test_tone_frequency": null,
-    "camera_enabled": false
+    "camera_enabled": false,
+    "camera_device": "/dev/video0"
   }
 }
 ```
@@ -158,7 +160,8 @@ http://127.0.0.1:8100/admin.html
 机器人主机还需要：
 
 - 阿里云 ARTC Linux SDK，默认放在 `robot/vendor/AliRTCSDK_Linux-7.11.0`。
-- `parecord`，用于采集系统默认麦克风。
+- `parecord` 或 PipeWire 的 `pw-record`，用于采集系统默认麦克风。
+- `ffmpeg`，启用 `camera_enabled` 时采集 `/dev/video0` 的 RGB24 视频帧。
 - `ffplay`，用于把客服声音播放到系统默认扬声器。
 
 安装机器人 Python 依赖并启动：
@@ -191,8 +194,10 @@ http://127.0.0.1:8100/
 6. 机器人扬声器播放客服声音，同时机器人麦克风继续向当前客服回传。
 7. 点击“释放接管”关闭客服麦克风。
 8. 点击“离开会话”只释放占用，会话重新变为“等待客服接入”。
-9. 点击“结束会话”会结束整次业务，机器人停止媒体并退出进程。下一次外部呼叫重新
-   拉起机器人时，只验证数据库中已有的 Robot ID 和 Credential，不会重新注册。
+9. 点击“结束会话”会结束整次业务并让机器人停止媒体；机器人连续 5 分钟没有新会话
+   时自动退出进程。点击“结束机器人进程”会立即结束远端机器人进程。
+   下一次外部呼叫重新拉起机器人时，只验证数据库中已有的 Robot ID 和 Credential，
+   不会重新注册。
 
 首次部署完成的最低验收标准：
 
@@ -237,7 +242,9 @@ http://127.0.0.1:8100/
   助手仅支持 Windows x64。
 - Conda 环境 `rtc`，Python 3.10.x。
 - 阿里云 ARTC Linux SDK 7.11.0，放在被忽略的 `robot/vendor/`。
-- 机器人真实麦克风通过系统默认输入源和 `parecord` 采集，运行机需提供该命令。
+- 机器人真实麦克风通过系统默认输入源采集，优先使用 `parecord`，缺失时使用
+  `pw-record`。
+- 可选摄像头通过 `ffmpeg` 从 `camera_device` 采集，默认分辨率为 640x480、15 fps。
 - 客服工作台不需要 npm 或前端构建；由 Python 标准库启动独立静态服务。
 
 ```bash
@@ -530,6 +537,7 @@ curl http://<控制端Tailscale-IP>:8000/api/health
     "credential": "<设备凭证>",
     "sdk_root": "robot/vendor/AliRTCSDK_Linux-7.11.0",
     "log_dir": "/tmp/artc-robot-logs",
+    "idle_exit_seconds": 300,
     "audio_output": true
   }
 }
@@ -538,6 +546,13 @@ curl http://<控制端Tailscale-IP>:8000/api/health
 机器人连接地址来自 `cluster.control_url`，不在 `robot` 节重复配置。
 `audio_output=true` 时机器人通过 `ffplay` 把客服语音播放到系统默认扬声器；
 未配置时也默认启用；`false` 仅统计远端音频并丢弃，用于没有扬声器的降级环境。
+`camera_enabled=true` 时机器人通过 `ffmpeg` 从 `camera_device` 采集 RGB24 视频并
+发布到 ARTC；`cameraPublished` 会按实际采集进程状态上报。
+`idle_exit_seconds` 默认为 300；会话结束或媒体断开后，连续该秒数没有新会话时机器人
+会停止所有媒体并退出进程。
+同一 `robot_id` 只允许一个机器人进程；重复启动会显示已有进程 PID 和锁文件路径。
+启动时还会清理父进程已经退出、工作目录属于当前项目且已变成 PID 1 的
+`AliRtcCoreService`、`ffmpeg`、`ffplay`、`pw-record` 等残留媒体进程。
 
 推荐先由管理员创建机器人并保存一次性返回的 `Robot ID + Credential`，再填入机器人
 配置。机器人登录后如果仍是待审批状态，会自动等待管理员处理。也可以在机器人配置中

@@ -11,7 +11,11 @@ from server.app import create_app
 from server.auth import create_or_update_admin
 from server.config import ServerConfig
 from server.db import Database
-from tests.asgi_client import request_json, websocket_messages
+from tests.asgi_client import (
+    open_websocket,
+    request_json,
+    websocket_messages,
+)
 
 
 class ArtcApiTests(unittest.TestCase):
@@ -375,6 +379,96 @@ class ArtcApiTests(unittest.TestCase):
         )
         self.assertEqual(messages[0]["type"], "websocket.close")
         self.assertEqual(messages[0]["code"], 4401)
+
+    def test_agent_can_terminate_online_robot(self) -> None:
+        admin_token = self.login("admin", "admin-password", admin=True)
+        admin_headers = self.auth_headers(admin_token)
+        status, _, scenario = self.request(
+            "POST",
+            "/api/admin/scenarios",
+            body={"name": "终止机器人场景"},
+            headers=admin_headers,
+        )
+        self.assertEqual(status, 200, scenario)
+        status, _, agent = self.request(
+            "POST",
+            "/api/admin/agents",
+            body={
+                "username": "terminate-agent",
+                "password": "agent-password",
+                "displayName": "终止客服",
+                "scenarioIds": [scenario["id"]],
+            },
+            headers=admin_headers,
+        )
+        self.assertEqual(status, 200, agent)
+        status, _, robot = self.request(
+            "POST",
+            "/api/admin/robots",
+            body={
+                "displayName": "终止机器人",
+                "scenarioId": scenario["id"],
+            },
+            headers=admin_headers,
+        )
+        self.assertEqual(status, 200, robot)
+        self.request(
+            "POST",
+            f"/api/admin/robots/{robot['id']}/approve",
+            headers=admin_headers,
+        )
+        status, _, robot_login = self.request(
+            "POST",
+            "/api/robot/login",
+            body={
+                "robotId": robot["id"],
+                "credential": robot["credential"],
+            },
+        )
+        self.assertEqual(status, 200, robot_login)
+        robot_headers = self.auth_headers(robot_login["accessToken"])
+        status, _, ticket = self.request(
+            "GET",
+            "/api/robot/ws-ticket",
+            headers=robot_headers,
+        )
+        self.assertEqual(status, 200, ticket)
+        agent_token = self.login("terminate-agent", "agent-password")
+        agent_headers = self.auth_headers(agent_token)
+
+        async def scenario():
+            connection = await open_websocket(
+                self.app,
+                ticket=ticket["ticket"],
+            )
+            try:
+                response = await request_json(
+                    self.app,
+                    "POST",
+                    f"/api/robots/{robot['id']}/terminate",
+                    headers=agent_headers,
+                )
+                message = await connection.next_message()
+                return response, message
+            finally:
+                await connection.close()
+
+        (status, _, result), message = asyncio.run(scenario())
+
+        self.assertEqual(status, 200, result)
+        self.assertTrue(result["delivered"])
+        self.assertEqual(message["type"], "robot_shutdown")
+        self.assertEqual(message["robotId"], robot["id"])
+        status, _, audit = self.request(
+            "GET",
+            "/api/admin/audit?limit=100",
+            headers=admin_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertIn(
+            "robot_terminate_requested",
+            {event["action"] for event in audit},
+        )
 
     def test_websocket_snapshot_ticket_and_ping(self) -> None:
         token = self.login("admin", "admin-password", admin=True)

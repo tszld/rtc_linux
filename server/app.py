@@ -650,6 +650,51 @@ def create_app(
         await _broadcast_session_end(resolved_db, manager, result)
         return result["session"]
 
+    @app.post("/api/robots/{robot_id}/terminate")
+    async def agent_terminate_robot(
+        robot_id: str,
+        principal: Principal = Depends(require_agent),
+    ) -> dict[str, Any]:
+        with resolved_db.connection() as connection:
+            robot = ensure_robot_access(
+                connection,
+                actor=principal,
+                robot_id=robot_id,
+            )
+        delivered = await manager.send_to_robot(
+            robot_id,
+            {
+                "type": "robot_shutdown",
+                "robotId": robot_id,
+                "reason": "agent_requested",
+                "requestedBy": principal.id,
+                "occurredAt": utc_now_text(),
+            },
+        )
+        if not delivered:
+            raise ServiceError(
+                "机器人控制连接不在线，无法结束远端进程",
+                409,
+            )
+        with resolved_db.transaction(immediate=True) as connection:
+            insert_audit(
+                connection,
+                actor_type="agent",
+                actor_id=principal.id,
+                action="robot_terminate_requested",
+                target_type="robot",
+                target_id=robot_id,
+                metadata={
+                    "displayName": robot["display_name"],
+                    "reason": "agent_requested",
+                },
+            )
+        return {
+            "ok": True,
+            "robotId": robot_id,
+            "delivered": True,
+        }
+
     @app.post("/api/robot-sessions/{session_id}/viewer-token")
     async def viewer_token(
         session_id: str,

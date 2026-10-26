@@ -24,11 +24,13 @@ class RobotConfig:
     display_name: str = ""
     heartbeat_seconds: float = 5
     reconnect_seconds: float = 2
+    idle_exit_seconds: float = 300
     auto_start_session: bool = True
     exit_when_session_ends: bool = True
     audio_output: bool = True
     test_tone_frequency: float | None = None
     camera_enabled: bool = False
+    camera_device: str = "/dev/video0"
 
     @classmethod
     def load(
@@ -46,11 +48,13 @@ class RobotConfig:
                 "log_dir",
                 "heartbeat_seconds",
                 "reconnect_seconds",
+                "idle_exit_seconds",
                 "auto_start_session",
                 "exit_when_session_ends",
                 "audio_output",
                 "test_tone_frequency",
                 "camera_enabled",
+                "camera_device",
             },
         )
         backend_url = get_control_url(config_path)
@@ -97,6 +101,11 @@ class RobotConfig:
                     "robot.test_tone_frequency 必须是数字或 null"
                 ) from exc
 
+        camera_device_value = values.get("camera_device", "/dev/video0")
+        if not isinstance(camera_device_value, str):
+            raise ValueError("robot.camera_device 必须是字符串")
+        camera_device = camera_device_value.strip()
+
         config = cls(
             backend_url=backend_url,
             robot_id=robot_id,
@@ -111,6 +120,7 @@ class RobotConfig:
             ).strip()[:128],
             heartbeat_seconds=number("heartbeat_seconds", 5),
             reconnect_seconds=number("reconnect_seconds", 2),
+            idle_exit_seconds=number("idle_exit_seconds", 300),
             auto_start_session=boolean("auto_start_session", True),
             exit_when_session_ends=boolean(
                 "exit_when_session_ends",
@@ -119,9 +129,14 @@ class RobotConfig:
             audio_output=boolean("audio_output", True),
             test_tone_frequency=tone_frequency,
             camera_enabled=boolean("camera_enabled", False),
+            camera_device=camera_device,
         )
-        if config.heartbeat_seconds <= 0 or config.reconnect_seconds <= 0:
-            raise ValueError("机器人心跳和重连间隔必须大于 0")
-        if config.camera_enabled:
-            raise ValueError("当前 Linux PoC 尚未启用摄像头采集")
+        if (
+            config.heartbeat_seconds <= 0
+            or config.reconnect_seconds <= 0
+            or config.idle_exit_seconds <= 0
+        ):
+            raise ValueError("机器人心跳、重连和空闲退出时间必须大于 0")
+        if config.camera_enabled and not config.camera_device:
+            raise ValueError("robot.camera_device 不能为空")
         return config

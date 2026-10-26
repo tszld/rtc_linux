@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import array
-import audioop
+import math
 import queue
 import shutil
 import subprocess
@@ -50,7 +50,17 @@ def apply_pcm_gain(data: bytes, volume: int) -> bytes:
         return data
     if volume == 0:
         return b"\x00" * len(data)
-    return audioop.mul(data, 2, volume / 100)
+    samples = array.array("h")
+    samples.frombytes(data)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    factor = volume / 100.0
+    for index, sample in enumerate(samples):
+        scaled = math.floor(sample * factor)
+        samples[index] = max(-32768, min(32767, scaled))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
 
 
 class NullPcmOutput:
@@ -89,6 +99,8 @@ class FfplayPcmOutput:
         self._process: subprocess.Popen[bytes] | None = None
         self._failure: str | None = None
         self._closed = False
+        self._restart_count = 0
+        self._max_restarts = 3
         self._volume = 100
         self._volume_lock = threading.Lock()
         self._worker = threading.Thread(
@@ -106,7 +118,7 @@ class FfplayPcmOutput:
         if self._closed:
             raise RuntimeError("PCM 输出已经关闭")
         if self._failure:
-            raise RuntimeError(self._failure)
+            return
         if frame.sample_bits != 16:
             raise RuntimeError(
                 f"ffplay 输出仅支持 16-bit PCM，收到 {frame.sample_bits}-bit"
@@ -140,57 +152,87 @@ class FfplayPcmOutput:
                 frame = self._frames.get()
                 if frame is None:
                     break
-                if self._process is None:
-                    assert self._format is not None
-                    sample_rate, channels = self._format
-                    self._process = subprocess.Popen(
-                        [
-                            self._ffplay_path,
-                            "-nodisp",
-                            "-autoexit",
-                            "-loglevel",
-                            "error",
-                            "-f",
-                            "s16le",
-                            "-ar",
-                            str(sample_rate),
-                            "-ac",
-                            str(channels),
-                            "-i",
-                            "pipe:0",
-                        ],
-                        stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE,
-                    )
-                if self._process.stdin is None:
-                    raise RuntimeError("ffplay 标准输入不可用")
-                with self._volume_lock:
-                    volume = self._volume
-                self._process.stdin.write(
-                    apply_pcm_gain(frame.data, volume)
-                )
-                self._process.stdin.flush()
+                while True:
+                    try:
+                        if self._process is None:
+                            self._start_process()
+                        if self._process.stdin is None:
+                            raise RuntimeError("ffplay 标准输入不可用")
+                        with self._volume_lock:
+                            volume = self._volume
+                        self._process.stdin.write(
+                            apply_pcm_gain(frame.data, volume)
+                        )
+                        self._process.stdin.flush()
+                        break
+                    except (BrokenPipeError, OSError) as exc:
+                        detail = self._stop_process()
+                        self._restart_count += 1
+                        if self._restart_count <= self._max_restarts:
+                            continue
+                        error_detail = f"{exc}"
+                        if detail:
+                            error_detail = f"{error_detail}; {detail}"
+                        raise RuntimeError(error_detail) from exc
         except (BrokenPipeError, OSError, RuntimeError) as exc:
             self._failure = f"播放远端 PCM 失败：{exc}"
+            print(self._failure, file=sys.stderr, flush=True)
         finally:
-            process = self._process
-            if process is not None:
-                if process.stdin:
-                    try:
-                        process.stdin.close()
-                    except OSError:
-                        pass
-                try:
-                    process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                if process.stderr:
-                    process.stderr.close()
+            self._stop_process()
+
+    def _start_process(self) -> None:
+        assert self._format is not None
+        sample_rate, channels = self._format
+        self._process = subprocess.Popen(
+            [
+                self._ffplay_path,
+                "-nodisp",
+                "-autoexit",
+                "-loglevel",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                str(channels),
+                "-i",
+                "pipe:0",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    def _stop_process(self) -> str:
+        process = self._process
+        self._process = None
+        if process is None:
+            return ""
+        if process.stdin:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        detail = ""
+        if process.stderr:
+            try:
+                detail = process.stderr.read().decode(
+                    "utf-8",
+                    errors="replace",
+                ).strip()
+            finally:
+                process.stderr.close()
+        return detail
 
     def close(self) -> None:
         if self._closed:

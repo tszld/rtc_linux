@@ -30,10 +30,12 @@
     "log_dir": "/tmp/artc-robot-logs",
     "heartbeat_seconds": 5,
     "reconnect_seconds": 2,
+    "idle_exit_seconds": 300,
     "auto_start_session": true,
     "exit_when_session_ends": true,
     "audio_output": true,
     "test_tone_frequency": null,
-    "camera_enabled": false
+    "camera_enabled": false,
+    "camera_device": "/dev/video0"
   }
 }

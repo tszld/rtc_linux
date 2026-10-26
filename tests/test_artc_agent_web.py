@@ -520,6 +520,9 @@ class AgentWebAssetTests(unittest.TestCase):
         self.assertIn("session_released", source)
         self.assertIn("endSessionButton", source)
         self.assertIn("endCurrentSession", source)
+        self.assertIn("terminateRobotButton", source)
+        self.assertIn("terminateRemoteRobot", source)
+        self.assertIn("/terminate`", source)
 
     def test_agent_uses_lease_scoped_native_talk_token(self) -> None:
         source = (AGENT_WEB_DIR / "app.js").read_text(encoding="utf-8")

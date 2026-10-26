@@ -38,14 +38,7 @@ class MicrophonePublisher:
             raise ValueError("frame_ms is too short for a PCM frame")
         self.command = list(
             command
-            or [
-                "parecord",
-                "--raw",
-                "--format=s16le",
-                f"--rate={sample_rate}",
-                f"--channels={channels}",
-                "--latency-msec=20",
-            ]
+            or _default_capture_command(sample_rate, channels)
         )
         self.pushed_frames = 0
         self.push_errors = 0
@@ -99,7 +92,7 @@ class MicrophonePublisher:
         self,
         frame_count: int = 5,
         *,
-        timeout_seconds: float = 1.0,
+        timeout_seconds: float = 3.0,
     ) -> None:
         if not self.is_running:
             raise RuntimeError("Audio capture is not running")
@@ -210,3 +203,37 @@ class MicrophonePublisher:
         )
         self._running = False
         raise RuntimeError(self.last_error)
+
+
+def _default_capture_command(
+    sample_rate: int,
+    channels: int,
+) -> list[str]:
+    if shutil.which("parecord"):
+        return [
+            "parecord",
+            "--raw",
+            "--format=s16le",
+            f"--rate={sample_rate}",
+            f"--channels={channels}",
+            "--latency-msec=20",
+        ]
+    if shutil.which("pw-record"):
+        return [
+            "pw-record",
+            "--format",
+            "s16",
+            "--rate",
+            str(sample_rate),
+            "--channels",
+            str(channels),
+            "-",
+        ]
+    return [
+        "parecord",
+        "--raw",
+        "--format=s16le",
+        f"--rate={sample_rate}",
+        f"--channels={channels}",
+        "--latency-msec=20",
+    ]

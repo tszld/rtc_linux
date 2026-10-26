@@ -3,15 +3,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import queue
+import signal
 import sys
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from .api import RobotApiError, RobotBackendClient
 from .config import RobotConfig
 from .heartbeat import RobotHeartbeatWorker
 from .media import RobotMediaController
+from .process_cleanup import cleanup_orphaned_media_processes
+from .runtime_lock import RobotAlreadyRunningError, RobotProcessLock
 from .ws import RobotWebSocketReader
 
 
@@ -47,6 +51,7 @@ class RobotBusinessRuntime:
         self.current_session_id: str | None = None
         self.ws_connected = False
         self.running = True
+        self.idle_deadline: float | None = None
 
     def run(self, *, run_seconds: float | None = None) -> int:
         asyncio.set_event_loop(asyncio.new_event_loop())
@@ -71,8 +76,12 @@ class RobotBusinessRuntime:
             self.api.heartbeat()
             self.ws.start()
             self.heartbeat.start()
+            self._mark_no_session()
             while self.running:
                 if deadline is not None and time.monotonic() >= deadline:
+                    break
+                self._exit_if_idle()
+                if not self.running:
                     break
                 self._process_events()
                 self.media.pump()
@@ -128,7 +137,6 @@ class RobotBusinessRuntime:
 
     def stop(self) -> None:
         self.running = False
-        self.ws.stop()
         self.heartbeat.stop()
         if self.media.is_active:
             try:
@@ -137,6 +145,7 @@ class RobotBusinessRuntime:
                     self.api.end_session(self.current_session_id)
             except Exception:
                 pass
+        self.ws.stop()
         metrics = self.media.metrics()
         self.media.stop()
         print(
@@ -175,6 +184,8 @@ class RobotBusinessRuntime:
                 self._report_media()
             elif self.config.auto_start_session and self.ws_connected:
                 self._start_session()
+            else:
+                self._mark_no_session()
             return
         if event_type == "session_started":
             self._start_or_follow_session(event["session"])
@@ -183,8 +194,19 @@ class RobotBusinessRuntime:
             if event.get("session", {}).get("id") == self.current_session_id:
                 self._stop_media()
                 if self.config.exit_when_session_ends:
-                    print("业务会话已结束，机器人进程退出。", flush=True)
-                    self.running = False
+                    print(
+                        "业务会话已结束，"
+                        f"{self.config.idle_exit_seconds:g} 秒内无新会话将退出。",
+                        flush=True,
+                    )
+            return
+        if event_type == "robot_shutdown":
+            print(
+                "收到客服结束机器人进程命令，"
+                f"reason={event.get('reason', '')}",
+                flush=True,
+            )
+            self.running = False
             return
         if event_type == "agent_takeover":
             self.takeover_active = True
@@ -238,11 +260,13 @@ class RobotBusinessRuntime:
         if not session_id or session.get("status") == "ended":
             return
         if self.media.is_active and self.current_session_id == session_id:
+            self._mark_session_active()
             return
         self._stop_media()
         self.current_session_id = session_id
         auth = self.api.rtc_token()
         self.media.start(auth, session_id)
+        self._mark_session_active()
         self._apply_microphone_policy()
         self._report_media()
         print(f"机器人业务会话已入会：{session_id}", flush=True)
@@ -273,7 +297,7 @@ class RobotBusinessRuntime:
             self.api.media_state(
                 session_id=self.current_session_id,
                 microphone_published=self.media.microphone_enabled,
-                camera_published=False,
+                camera_published=self.media.camera_enabled,
                 automatic_speech_paused=self.automatic_speech_paused,
             )
         except RobotApiError as exc:
@@ -294,9 +318,35 @@ class RobotBusinessRuntime:
                 pass
         self.media.stop()
         self.current_session_id = None
+        self._mark_no_session()
         self.takeover_active = False
         self.automatic_speech_paused = False
         self.robot_microphone_requested = False
+
+    def _mark_session_active(self) -> None:
+        self.idle_deadline = None
+
+    def _mark_no_session(self) -> None:
+        if not self.config.exit_when_session_ends:
+            self.idle_deadline = None
+            return
+        if self.idle_deadline is None:
+            self.idle_deadline = (
+                time.monotonic() + self.config.idle_exit_seconds
+            )
+
+    def _exit_if_idle(self) -> None:
+        if (
+            self.idle_deadline is not None
+            and time.monotonic() >= self.idle_deadline
+        ):
+            print(
+                "连续 "
+                f"{self.config.idle_exit_seconds:g} 秒没有业务会话，"
+                "机器人进程退出。",
+                flush=True,
+            )
+            self.running = False
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -309,14 +359,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not sys.platform.startswith("linux"):
         print("ARTC 机器人端只支持 Linux。", file=sys.stderr)
         return 1
+    signal.signal(signal.SIGTERM, _handle_termination)
     args = parse_args(argv)
     try:
         config = RobotConfig.load()
     except ValueError as exc:
         print(f"机器人配置错误：{exc}", file=sys.stderr)
         return 1
-    runtime = RobotBusinessRuntime(config)
-    return runtime.run(run_seconds=args.run_seconds)
+    try:
+        with RobotProcessLock(config.robot_id):
+            cleaned = cleanup_orphaned_media_processes(
+                Path(__file__).resolve().parent.parent
+            )
+            if cleaned:
+                print(
+                    "已清理残留媒体进程："
+                    + ",".join(str(pid) for pid in cleaned),
+                    flush=True,
+                )
+            runtime = RobotBusinessRuntime(config)
+            return runtime.run(run_seconds=args.run_seconds)
+    except RobotAlreadyRunningError as exc:
+        print(f"机器人启动失败：{exc}", file=sys.stderr)
+        return 1
+
+
+def _handle_termination(_signum: int, _frame: object) -> None:
+    raise KeyboardInterrupt
 
 
 if __name__ == "__main__":

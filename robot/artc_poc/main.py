@@ -159,15 +159,19 @@ def set_microphone_enabled(
         if audio_publisher is not None:
             try:
                 audio_publisher.start()
-                audio_publisher.prime(5)
+                try:
+                    audio_publisher.prime(5, timeout_seconds=3.0)
+                except RuntimeError as exc:
+                    if "No PCM data received" not in str(exc):
+                        raise
+                    print(
+                        f"麦克风暂未返回音频，继续等待采集：{exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             except Exception:
                 audio_publisher.stop()
                 raise
-            if audio_publisher.last_error:
-                audio_publisher.stop()
-                raise PoCSessionError(
-                    f"audio source failed: {audio_publisher.last_error}"
-                )
         try:
             session.set_microphone_enabled(True)
         except Exception:

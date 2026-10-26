@@ -1,20 +1,65 @@
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from robot.artc_poc.audio import NullPcmOutput, PcmFrame, apply_pcm_gain
+from robot.artc_poc.audio import (
+    FfplayPcmOutput,
+    NullPcmOutput,
+    PcmFrame,
+    apply_pcm_gain,
+)
+from robot.artc_poc.camera import CameraPublisher
 from robot.artc_poc.main import (
     read_token,
     set_microphone_enabled,
     validate_token_scope,
 )
-from robot.artc_poc.microphone import MicrophonePublisher
+from robot.artc_poc.microphone import (
+    MicrophonePublisher,
+    _default_capture_command,
+)
 from robot.artc_poc.session import PoCSessionError, RobotPoCSession
 from robot.artc_poc.tone import TonePublisher, build_tone_frame
 from tools.artc_poc_token import build_artc_token
+
+
+class AudioCompatibilityTests(unittest.TestCase):
+    def test_audio_module_imports_without_audioop(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        script = """
+import sys
+
+class BlockAudioop:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "audioop":
+            raise ModuleNotFoundError("No module named 'audioop'")
+        return None
+
+sys.meta_path.insert(0, BlockAudioop())
+import robot.artc_poc.audio
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=root,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_ffplay_failure_does_not_raise_from_audio_callback(self) -> None:
+        output = FfplayPcmOutput(ffplay_path="unused")
+        output._failure = "播放远端 PCM 失败：broken pipe"
+        try:
+            output.feed(PcmFrame(b"\x00\x00" * 480, 48000, 1, 16))
+        finally:
+            output.close()
 
 
 class FakeEngine:
@@ -28,8 +73,19 @@ class FakeEngine:
         channel: str,
         user_id: str,
         user_name: str,
+        *,
+        video_enabled: bool = False,
     ) -> int:
-        self.calls.append(("join", token, channel, user_id, user_name))
+        self.calls.append(
+            (
+                "join",
+                token,
+                channel,
+                user_id,
+                user_name,
+                video_enabled,
+            )
+        )
         return self.join_result
 
     def set_microphone_enabled(self, enabled: bool) -> int:
@@ -61,7 +117,7 @@ class RobotPoCSessionTests(unittest.TestCase):
         self.assertEqual(engine.calls[0], ("microphone", False))
         self.assertEqual(
             engine.calls[1],
-            ("join", "token", "channel-1", "robot-1", "Robot"),
+            ("join", "token", "channel-1", "robot-1", "Robot", False),
         )
         self.assertEqual(session.state, "joining")
 
@@ -69,6 +125,23 @@ class RobotPoCSessionTests(unittest.TestCase):
 
         self.assertEqual(session.state, "joined")
         self.assertFalse(session.microphone_enabled)
+
+    def test_join_forwards_video_enabled(self) -> None:
+        session, engine, _ = self.make_session()
+
+        session.join(
+            "token",
+            "channel-1",
+            "robot-1",
+            "Robot",
+            video_enabled=True,
+        )
+
+        self.assertEqual(
+            engine.calls[1],
+            ("join", "token", "channel-1", "robot-1", "Robot", True),
+        )
+        self.assertTrue(session.video_enabled)
 
     def test_microphone_requires_joined_state(self) -> None:
         session, _, _ = self.make_session()
@@ -98,7 +171,11 @@ class RobotPoCSessionTests(unittest.TestCase):
             def start(self) -> None:
                 return
 
-            def prime(self, frame_count: int) -> None:
+            def prime(
+                self,
+                frame_count: int,
+                timeout_seconds: float = 3.0,
+            ) -> None:
                 raise RuntimeError("capture failed")
 
             def stop(self) -> None:
@@ -114,6 +191,32 @@ class RobotPoCSessionTests(unittest.TestCase):
 
         self.assertEqual(publisher.stop_calls, 1)
         self.assertFalse(session.microphone_enabled)
+
+    def test_initial_pcm_timeout_keeps_capture_running(self) -> None:
+        class SlowPublisher:
+            def __init__(self) -> None:
+                self.stop_calls = 0
+
+            def start(self) -> None:
+                return
+
+            def prime(self, frame_count: int, timeout_seconds: float = 3.0) -> None:
+                raise RuntimeError(
+                    "No PCM data received from the default input source"
+                )
+
+            def stop(self) -> None:
+                self.stop_calls += 1
+
+        session, _, _ = self.make_session()
+        session.join("token", "channel-1", "robot-1", "Robot")
+        session.on_join_result(0, "channel-1", "robot-1")
+        publisher = SlowPublisher()
+
+        set_microphone_enabled(session, publisher, True)
+
+        self.assertTrue(session.microphone_enabled)
+        self.assertEqual(publisher.stop_calls, 0)
 
     def test_remote_pcm_is_forwarded_to_output(self) -> None:
         session, _, output = self.make_session()
@@ -282,6 +385,32 @@ class SyntheticToneTests(unittest.TestCase):
 
 
 class MicrophonePublisherTests(unittest.TestCase):
+    def test_pw_record_is_used_when_parecord_is_missing(self) -> None:
+        def which(command: str) -> str | None:
+            if command == "pw-record":
+                return "/usr/bin/pw-record"
+            return None
+
+        with patch(
+            "robot.artc_poc.microphone.shutil.which",
+            side_effect=which,
+        ):
+            command = _default_capture_command(16000, 1)
+
+        self.assertEqual(
+            command,
+            [
+                "pw-record",
+                "--format",
+                "s16",
+                "--rate",
+                "16000",
+                "--channels",
+                "1",
+                "-",
+            ],
+        )
+
     def test_pcm_is_split_into_ten_millisecond_frames(self) -> None:
         class FakeMicrophoneEngine:
             def __init__(self) -> None:
@@ -329,6 +458,68 @@ class MicrophonePublisherTests(unittest.TestCase):
         publisher._running = True
 
         with self.assertRaisesRegex(RuntimeError, "device disconnected"):
+            publisher.pump()
+
+        self.assertFalse(publisher._running)
+
+
+class CameraPublisherTests(unittest.TestCase):
+    def test_only_latest_complete_frame_is_pushed(self) -> None:
+        class FakeCameraEngine:
+            def __init__(self) -> None:
+                self.frames = []
+
+            def push_external_video_frame(
+                self,
+                data: bytes,
+                width: int,
+                height: int,
+                timestamp_ms: int,
+            ) -> int:
+                self.frames.append((data, width, height, timestamp_ms))
+                return 0
+
+        engine = FakeCameraEngine()
+        publisher = CameraPublisher(
+            engine,
+            width=2,
+            height=1,
+            fps=15,
+        )
+        publisher._buffer.extend(b"a" * 6 + b"b" * 6)
+
+        publisher._push_latest_frame()
+
+        self.assertEqual(
+            engine.frames,
+            [(b"b" * 6, 2, 1, 0)],
+        )
+        self.assertEqual(publisher.dropped_frames, 1)
+        self.assertEqual(publisher.pushed_frames, 1)
+
+    def test_capture_process_failure_is_not_silently_ignored(self) -> None:
+        class FakeProcess:
+            returncode = 1
+            stdout = io.BytesIO()
+            stderr = io.BytesIO(b"camera disconnected")
+
+            def poll(self) -> int:
+                return self.returncode
+
+        engine = type(
+            "FakeCameraEngine",
+            (),
+            {
+                "push_external_video_frame": (
+                    lambda self, data, width, height, timestamp: 0
+                ),
+            },
+        )()
+        publisher = CameraPublisher(engine, width=2, height=1)
+        publisher._process = FakeProcess()
+        publisher._running = True
+
+        with self.assertRaisesRegex(RuntimeError, "camera disconnected"):
             publisher.pump()
 
         self.assertFalse(publisher._running)

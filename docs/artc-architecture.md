@@ -257,6 +257,7 @@ POST /api/robot-sessions/{session_id}/takeover-lease/release
 POST /api/robot-sessions/{session_id}/takeover-lease/microphone
 POST /api/robot-sessions/{session_id}/listen
 POST /api/robot-sessions/{session_id}/agent-playback-volume
+POST /api/robots/{robot_id}/terminate
 ```
 
 ### 管理员

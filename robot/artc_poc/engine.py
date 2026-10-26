@@ -105,12 +105,14 @@ class OfficialArtcEngine:
         channel: str,
         user_id: str,
         user_name: str,
+        *,
+        video_enabled: bool = False,
     ) -> int:
         join_config = self._defines.JoinChannelConfig()
         join_config.channelProfile = (
             self._defines.ChannelProfile.ChannelProfileInteractiveLive
         )
-        join_config.isAudioOnly = True
+        join_config.isAudioOnly = not video_enabled
         join_config.publishMode = self._defines.PublishMode.PublishAutomatically
         join_config.subscribeMode = (
             self._defines.SubscribeMode.SubscribeAutomatically
@@ -122,9 +124,15 @@ class OfficialArtcEngine:
             self._defines.PublishAvsyncMode.PublishAvsyncNoDelay
         )
 
-        # 官方 SDK 默认自动开启麦克风和视频；必须在入会前显式关闭。
-        self._check_result(self._engine.PublishLocalVideoStream(False), "关闭视频")
+        # 官方 SDK 默认自动开启麦克风和视频；必须在入会前显式设置。
         self._check_result(self._engine.PublishLocalAudioStream(False), "关闭麦克风")
+        if video_enabled:
+            self._configure_external_video()
+        else:
+            self._check_result(
+                self._engine.PublishLocalVideoStream(False),
+                "关闭视频",
+            )
         self._check_result(
             self._engine.SetClientRole(
                 self._defines.AliEngineClientRole.AliEngineClientRoleInteractive
@@ -139,6 +147,39 @@ class OfficialArtcEngine:
             join_config,
         )
         return int(result)
+
+    def _configure_external_video(self) -> None:
+        encoder_config = self._defines.AliEngineVideoEncoderConfiguration(
+            640,
+            480,
+            self._defines.AliEngineFrameRate.AliEngineFrameRateFps15,
+            512,
+            (
+                self._defines.AliEngineVideoEncoderOrientationMode
+                .AliEngineVideoEncoderOrientationModeAdaptive
+            ),
+            (
+                self._defines.AliEngineVideoMirrorMode
+                .AliEngineVideoMirrorModeDisabled
+            ),
+            self._defines.AliEngineRotationMode.AliEngineRotationMode_0,
+        )
+        self._check_result(
+            self._engine.SetVideoEncoderConfiguration(encoder_config),
+            "设置视频编码参数",
+        )
+        self._check_result(
+            self._engine.SetExternalVideoSource(
+                True,
+                self._defines.VideoSource.VideoSourceCamera,
+                self._defines.RenderMode.RenderModeFill,
+            ),
+            "启用外部视频源",
+        )
+        self._check_result(
+            self._engine.PublishLocalVideoStream(True),
+            "开启视频推流",
+        )
 
     def set_microphone_enabled(self, enabled: bool) -> int:
         return int(self._engine.PublishLocalAudioStream(bool(enabled)))
@@ -164,6 +205,43 @@ class OfficialArtcEngine:
                 data,
                 len(data),
                 int(timestamp_ms),
+            )
+        )
+
+    def push_external_video_frame(
+        self,
+        data: bytes,
+        width: int,
+        height: int,
+        timestamp_ms: int,
+    ) -> int:
+        if width <= 0 or height <= 0:
+            raise ValueError("Video dimensions must be positive")
+        expected_size = width * height * 3
+        if len(data) != expected_size:
+            raise ValueError(
+                f"RGB24 frame length must be {expected_size} bytes"
+            )
+        sample = self._defines.VideoDataSample()
+        sample.width = int(width)
+        sample.height = int(height)
+        sample.strideY = int(width)
+        sample.strideU = int(width)
+        sample.strideV = int(width)
+        sample.dataLen = expected_size
+        sample.format = (
+            self._defines.VideoDataFormat.VideoDataFormatRGB24
+        )
+        sample.bufferType = (
+            self._defines.VideoBufferType.VideoBufferTypeRawData
+        )
+        sample.rotation = 0
+        sample.data = data
+        sample.timeStamp = int(timestamp_ms)
+        return int(
+            self._engine.PushExternalVideoFrame(
+                sample,
+                self._defines.VideoSource.VideoSourceCamera,
             )
         )
 

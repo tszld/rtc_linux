@@ -34,6 +34,8 @@ class RobotEngine(Protocol):
         channel: str,
         user_id: str,
         user_name: str,
+        *,
+        video_enabled: bool = False,
     ) -> int:
         ...
 
@@ -68,6 +70,7 @@ class RobotPoCSession:
         self.engine: RobotEngine | None = None
         self.state = "idle"
         self.microphone_enabled = False
+        self.video_enabled = False
         self.channel = ""
         self.user_id = ""
         self.remote_users: set[str] = set()
@@ -98,6 +101,8 @@ class RobotPoCSession:
         channel: str,
         user_id: str,
         user_name: str,
+        *,
+        video_enabled: bool = False,
     ) -> None:
         if self.engine is None:
             raise PoCSessionError("Robot Engine 尚未绑定")
@@ -108,6 +113,7 @@ class RobotPoCSession:
 
         self.channel = channel
         self.user_id = user_id
+        self.video_enabled = video_enabled
         self.state = "joining"
         self._join_finished.clear()
         self._leave_finished.clear()
@@ -117,7 +123,13 @@ class RobotPoCSession:
             self.state = "error"
             raise PoCSessionError(f"加入频道前关闭麦克风失败：{mic_result}")
 
-        result = self.engine.join(token, channel, user_id, user_name)
+        result = self.engine.join(
+            token,
+            channel,
+            user_id,
+            user_name,
+            video_enabled=video_enabled,
+        )
         if result != 0:
             self.state = "error"
             raise PoCSessionError(f"调用 ARTC JoinChannel 失败：{result}")

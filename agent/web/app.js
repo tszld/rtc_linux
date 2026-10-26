@@ -87,6 +87,7 @@ const elements = {
   joinButton: document.querySelector("#joinButton"),
   leaveButton: document.querySelector("#leaveButton"),
   endSessionButton: document.querySelector("#endSessionButton"),
+  terminateRobotButton: document.querySelector("#terminateRobotButton"),
   listenButton: document.querySelector("#listenButton"),
   toastRegion: document.querySelector("#toastRegion"),
 };
@@ -144,6 +145,7 @@ const state = {
   leaving: false,
   leavingSessionId: null,
   endingSessionId: null,
+  terminatingRobot: false,
 };
 
 
@@ -941,6 +943,9 @@ function renderSessionWorkspace() {
       : "开始处理";
   elements.leaveButton.disabled = !isJoined;
   elements.endSessionButton.disabled = !isJoined;
+  elements.terminateRobotButton.disabled = (
+    !isJoined || state.terminatingRobot
+  );
   elements.listenButton.disabled = !isJoined;
   elements.listenButton.textContent = state.listening ? "停止听取" : "开始听取";
 
@@ -1454,6 +1459,48 @@ async function endCurrentSession() {
     showToast(errorText(error), "danger");
   } finally {
     state.endingSessionId = null;
+    render();
+  }
+}
+
+
+async function terminateRemoteRobot() {
+  const session = sessionById(state.joinedSessionId);
+  if (!session || state.terminatingRobot) {
+    return;
+  }
+  const robot = robotForSession(session);
+  const robotName = robot?.displayName || session.robotDisplayName || "机器人";
+  if (
+    !window.confirm(
+      `将立即结束远端“${robotName}”进程并退出当前频道，确认继续？`,
+    )
+  ) {
+    return;
+  }
+
+  state.terminatingRobot = true;
+  render();
+  try {
+    await stopLocalMicrophone();
+    await stopNativeAudio();
+    const result = await apiRequest(
+      `/api/robots/${encodeURIComponent(session.robotId)}/terminate`,
+      { method: "POST", body: {} },
+    );
+    if (!result.delivered) {
+      throw new Error("机器人控制连接不在线");
+    }
+    showToast("退出命令已送达，正在等待机器人离线", "success");
+    await leaveSession({
+      silent: true,
+      releaseTakeover: false,
+      releaseClaim: false,
+    });
+  } catch (error) {
+    showToast(`结束机器人进程失败：${errorText(error)}`, "danger");
+  } finally {
+    state.terminatingRobot = false;
     render();
   }
 }
@@ -1977,6 +2024,7 @@ function bindEvents() {
   elements.joinButton.addEventListener("click", () => void joinSelectedSession());
   elements.leaveButton.addEventListener("click", () => void leaveSession());
   elements.endSessionButton.addEventListener("click", () => void endCurrentSession());
+  elements.terminateRobotButton.addEventListener("click", () => void terminateRemoteRobot());
   elements.listenButton.addEventListener("click", () => void toggleListening());
   elements.takeoverButton.addEventListener("click", () => void acquireTakeover());
   elements.releaseButton.addEventListener("click", () => void releaseTakeover());

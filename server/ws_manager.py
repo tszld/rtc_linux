@@ -65,10 +65,15 @@ class WebSocketManager:
         self,
         robot_id: str,
         message: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         async with self._lock:
             connections = list(self._robots.get(robot_id, ()))
-        await self._send_many(self._robots, robot_id, connections, message)
+        return await self._send_many(
+            self._robots,
+            robot_id,
+            connections,
+            message,
+        )
 
     async def is_robot_connected(self, robot_id: str) -> bool:
         async with self._lock:
@@ -109,11 +114,13 @@ class WebSocketManager:
         principal_id: str,
         connections: list[WebSocket],
         message: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         dead = []
+        delivered = False
         for websocket in connections:
             try:
                 await websocket.send_json(message)
+                delivered = True
             except Exception:
                 dead.append(websocket)
         if dead:
@@ -124,3 +131,4 @@ class WebSocketManager:
                         current.discard(websocket)
                     if not current:
                         registry.pop(principal_id, None)
+        return delivered
